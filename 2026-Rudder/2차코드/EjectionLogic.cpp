@@ -100,6 +100,7 @@ bool updateEjection(const DataPacket &p) {
 // ── 착지 감지: 사출 후 고도 안정 + 가속도 ≈ 1g 5초 유지 (#24) ──────────
 bool checkLanded(const DataPacket &p) {
   if (!s_ejected) return false;
+  if (p.altitude_cm == -1) return false;   // BMP 실패 시 착지 판단 보류
 
   float ax = (float)p.acc[0];
   float ay = (float)p.acc[1];
