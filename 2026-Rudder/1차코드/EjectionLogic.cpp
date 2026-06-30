@@ -86,7 +86,7 @@ bool updateEjection(const DataPacket &p) {
     s_dropCount = 0;
   }
 
-  // ── 4. 보조 사출: 발사 후 12초 경과 + 하강 경향 동시 확인 ────────────
+  // ── 4. 보조 사출: 발사 후 10초 경과 + 하강 경향 동시 확인 ────────────
   uint32_t timerA_ms = (uint32_t)(TIMER_A_SEC * 1000.0f);
   if ((now - s_launchMs >= timerA_ms) && descending) {
     Serial.println("[EJ] TIMEOUT+DESC -> EJECT (backup)");
