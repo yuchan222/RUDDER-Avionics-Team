@@ -1,0 +1,45 @@
+# GPT 피드백 (1차 코드 검토)
+
+| 번호 | 분류 | 현재 문제 | 왜 문제인지 | 고칠 방향 |
+|---|---|---|---|---|
+| 1 | 필수 수정 | 센서/로그/텔레메트리 주기 고정 안 됨 | 루프 속도가 SD/센서/Serial에 따라 변함. BMP 50Hz, 텔레메트리 5Hz 보장 안 됨 | millis 기반 센서 20ms, 로그 20ms, 텔레메트리 200ms 분리 |
+| 2 | 논리 수정 | 보조 사출 조건에 descending 포함 | 12초 지나도 BMP 하강 판단 true여야 사출됨 | 12초 경과 && 미사출만으로 변경 |
+| 3 | 논리 수정 | 발사 감지가 BMP에 의존 | BMP 이상 시 발사감지 자체 안 됨, 보조타이머도 시작 안 됨 | Z축 가속도 일정시간 유지 기반 보조 발사감지 추가 |
+| 4 | 논리 수정 | Mode 0에서 통신 없으면 비행판단 시작 안 됨 | 통신 두절 시 자율사출 로직 자체 미시작 | 물리 ARM스위치 또는 전원인가 후 자동 baseline→Mode2 |
+| 5 | 필수 수정 | DataPacket.len 미충전 | 기본값 0, 채우는 코드 없음 | finalizePacket()에서 len/crc16 계산 |
+| 6 | 필수 수정 | 텔레메트리 CRC 미보장 | SD저장용 tmp에만 CRC계산, 실송신 pkt엔 갱신안됨 | SD저장/무선송신 모두 finalizePacket 이후 실행 |
+| 7 | 필수 수정 | altitude_cm이 int16_t | 최대 327m까지만 표현, 오버플로우 위험 | int32_t로 변경 |
+| 8 | 필수 수정 | 자이로 저장 스케일 불일치 | 500dps를 0.01dps 단위 int16_t 저장시 327dps에서 overflow | 0.1dps 단위 또는 int32_t |
+| 9 | 필수 수정 | INA219 코드 없음 | 보고서엔 있는데 미구현 | Adafruit_INA219 추가, voltage_mv/current_ma 패킷 추가 |
+| 10 | 필수 수정 | 센서 초기화 실패해도 진행 가능 | 에러출력만 함, 상태플래그 없음 | bmpOk/imuOk/sdOk 플래그, 실패시 Mode2 진입금지 |
+| 11 | 필수 수정 | SD 초기화 실패 처리 부족 | 실패해도 writePacket 호출 가능 | logReady 플래그, 실패시 비행모드 진입금지 |
+| 12 | 논리 수정 | CMD_MODE_NEXT/PREV 위험 | 중복수신시 모드 여러단계 이동 가능 | CMD_SET_STANDBY/ARMED/FORCE_EJECT로 변경 |
+| 13 | 안전 수정 | 비상사출 명령 너무 쉽게 실행 | 오입력/오수신에 취약 | Armed 상태, 발사감지 이후, ARM스위치 ON 조건 추가 |
+| 14 | 위험제거 | CMD_SYSRESET 무선리셋 가능 | 비행중 리셋시 사출판단 중단 | 비행코드에서 제거 또는 Mode0에서만 허용 |
+| 15 | 간소화 | CMD_TIMER_A, CMD_STOP 미사용 | 정의만 있고 미처리 | 삭제 |
+| 16 | 간소화 | ConfirmPacket, RxPacket1 미사용 | 통신구조 복잡해보임 | 삭제 또는 AckPacket 단순화 |
+| 17 | 간소화 | quat[4] 항상 0 | MPU6050은 자세추정 미사용인데 8바이트 낭비 | 삭제 |
+| 18 | 간소화 | getAltitude() 중복기능 | readSensors와 BMP 중복읽기 | readSensors 계산값만 사용 통일 |
+| 19 | 정확성 | LED가 실제 상태 무관하게 OK 켜짐 | 초기화 성공여부와 미연결 | systemStatus 비트기반 실제성공 LED ON |
+| 20 | 안전 | beep(ms)가 blocking | 비행중 호출시 센서/사출판단 멈춤 | 비행중 사용금지 또는 non-blocking 변경 |
+| 21 | 보완 | mode.txt 이전모드 그대로 복원 | 재부팅시 Mode2/3 복원 위험 | 부팅시 Mode2 이상은 무조건 Mode0 강제 |
+| 22 | 보완 | 서보각도 0/90 하드코딩 | 실제장치별 각도 다를수있음 | SERVO_CLOSED/EJECT_ANGLE Config.h로 이동 |
+| 23 | 보완 | BMP388 주소 0x76 고정 | 모듈따라 0x77일수있음 | 0x76 실패시 0x77 자동재시도 |
+| 24 | 미구현 | Mode4 자동착지전환 없음 | Mode3→4 자동전환 판단 없음 | 사출후 고도변화 작음+가속도1g 일정유지시 Mode4 |
+| 25 | 패킷보완 | 패킷에 mode/사출상태/센서상태 없음 | 지상국이 확인불가 | mode, eject_state, system_status 필드 추가 |
+
+## 가장 먼저 고칠 것
+1. loop 주기 millis 기반 분리
+2. 보조사출을 "12초 경과" 단독조건으로 변경
+3. BMP 이상 대비 보조 발사감지 추가
+4. 패킷 len/crc16 finalize 함수 추가
+5. altitude_cm, gyro 자료형/스케일 수정
+
+## 삭제/단순화 권장
+- CMD_TIMER_A, CMD_STOP: 삭제
+- CMD_SYSRESET: 삭제 또는 Mode0 한정
+- CMD_MODE_NEXT/PREV: 명확한 명령으로 교체
+- ConfirmPacket, RxPacket1: 정리
+- quat[4]: 삭제
+- getAltitude(): 삭제 또는 내부함수화
+- beep(delay): 비행중 사용금지
