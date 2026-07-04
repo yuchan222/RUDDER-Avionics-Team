@@ -235,8 +235,7 @@ class VirtualFlightSource(DataSource):
 # ─── pyserial SiK 소스 ────────────────────────────────────────────────────────
 class SerialSikSource(DataSource):
     """
-    실제 SiK 라디오 수신. 교체 방법:
-        src = SerialSikSource(port='COM3', baud=57600)
+    실제 SiK 라디오 수신. 사이드바에서 포트 선택 후 자동 전환.
     STX=0xAA55 기준으로 패킷 동기화, PKT_FMT 그대로 파싱.
     """
     def __init__(self, port: str = 'COM3', baud: int = 57600):
@@ -374,6 +373,63 @@ def _write_log(pkt: Pkt):
         f.flush()
 
 
+# ─── COM 포트 감지 ────────────────────────────────────────────────────────────
+def _list_serial_ports() -> List[tuple]:
+    """감지된 시리얼 포트 목록. [(표시명, 장치명), ...]"""
+    try:
+        import serial.tools.list_ports
+        ports = serial.tools.list_ports.comports()
+        return [
+            (f"{p.device} — {p.description[:35]}", p.device)
+            for p in sorted(ports, key=lambda p: p.device)
+        ]
+    except Exception:
+        return []
+
+
+def _reset_flight_data():
+    """소스 전환 시 비행 데이터 전체 초기화"""
+    st.session_state.t_list     = []
+    st.session_state.alt_list   = []
+    st.session_state.acc_list   = []
+    st.session_state.last_seq   = -1
+    st.session_state.lost_pkts  = 0
+    st.session_state.total_pkts = 0
+    st.session_state.rate_ts    = []
+    st.session_state.last_pkt   = None
+    st.session_state.timeline   = {'launch_t': None, 'eject_t': None, 'land_t': None}
+    st.session_state.prev_mode  = -1
+    st.session_state.prev_eject = 0
+
+
+def _switch_source(port: Optional[str], display: str):
+    """현재 소스 정지 → 새 소스 시작 → 데이터 초기화"""
+    old_src = st.session_state.get('source')
+    if old_src:
+        old_src.stop()
+
+    if port is None:
+        src = VirtualFlightSource()
+        info = '가상 데이터 (시뮬레이션)'
+    else:
+        src = SerialSikSource(port=port, baud=57600)
+        info = display
+
+    try:
+        src.start()
+        st.session_state.source          = src
+        st.session_state.connection_info = info
+        st.toast(f"연결됨: {info}", icon="✅")
+    except Exception as e:
+        st.error(f"연결 실패 ({port}): {e}")
+        fallback = VirtualFlightSource()
+        fallback.start()
+        st.session_state.source          = fallback
+        st.session_state.connection_info = '가상 데이터 (연결 실패 — 폴백)'
+
+    _reset_flight_data()
+
+
 # ─── Streamlit 페이지 설정 ────────────────────────────────────────────────────
 st.set_page_config(
     page_title="RUDDER GCS 2026",
@@ -390,17 +446,22 @@ def _init():
 
     src = VirtualFlightSource()
     src.start()
-    st.session_state.source     = src
-    st.session_state.t_list:    List[float]          = []
+    st.session_state.source          = src
+    st.session_state.connection_info = '가상 데이터 (시뮬레이션)'
+    st.session_state.t_list:    List[float]           = []
     st.session_state.alt_list:  List[Optional[float]] = []
-    st.session_state.acc_list:  List[float]          = []
+    st.session_state.acc_list:  List[float]           = []
     st.session_state.last_seq   = -1
     st.session_state.lost_pkts  = 0
     st.session_state.total_pkts = 0
-    st.session_state.rate_ts:   List[float]          = []   # 1초 윈도우
-    st.session_state.last_pkt:  Optional[Pkt]        = None
-    st.session_state.eject_phase   = 0      # 0=정상, 1=1차 클릭 대기
-    st.session_state.eject_click_t = 0.0
+    st.session_state.rate_ts:   List[float]           = []
+    st.session_state.last_pkt:  Optional[Pkt]         = None
+    st.session_state.eject_phase    = 0
+    st.session_state.eject_click_t  = 0.0
+    # 비행 타임라인
+    st.session_state.timeline   = {'launch_t': None, 'eject_t': None, 'land_t': None}
+    st.session_state.prev_mode  = -1   # 직전 flight_mode (이벤트 엣지 감지용)
+    st.session_state.prev_eject = 0    # 직전 eject_state
 
     path, f, w = _open_log()
     st.session_state.log_path   = path
@@ -409,6 +470,53 @@ def _init():
 
 
 # ─── UI 컴포넌트 ──────────────────────────────────────────────────────────────
+def _sidebar_connection():
+    """사이드바 — COM 포트 선택 및 연결"""
+    with st.sidebar:
+        st.markdown("### 🔌 연결 설정")
+
+        detected = _list_serial_ports()
+
+        # 옵션 목록 구성: 표시명 → 포트값
+        disp_list: List[str]          = ["가상 데이터 (시뮬레이션)"]
+        port_map:  dict[str, Optional[str]] = {"가상 데이터 (시뮬레이션)": None}
+
+        if detected:
+            for disp, dev in detected:
+                label = f"🔌 {disp}"
+                disp_list.append(label)
+                port_map[label] = dev
+
+        # 감지 안 된 COM1~COM10 수동 추가
+        detected_devs = {dev for _, dev in detected}
+        for i in range(1, 11):
+            dev = f"COM{i}"
+            if dev not in detected_devs:
+                disp_list.append(dev)
+                port_map[dev] = dev
+
+        selected_disp = st.selectbox(
+            "포트 선택",
+            disp_list,
+            index=0,
+            key="port_select",
+            help="감지된 포트는 🔌 아이콘으로 표시됩니다",
+        )
+
+        info = st.session_state.get('connection_info', '가상 데이터 (시뮬레이션)')
+        st.caption(f"현재 연결: **{info}**")
+
+        if st.button("연결", use_container_width=True, key="connect_btn", type="primary"):
+            port_val = port_map.get(selected_disp)
+            _switch_source(port_val, selected_disp)
+            st.rerun()
+
+        st.divider()
+        log_name = pathlib.Path(st.session_state.get('log_path', 'none')).name
+        st.caption(f"로그 파일: `{log_name}`")
+        st.caption(f"PKT 크기: {PKT_SIZE} bytes")
+
+
 def _mode_badge(mode: int):
     name  = FLIGHT_MODES.get(mode, "?")
     color = MODE_COLORS.get(mode, "#555")
@@ -465,6 +573,20 @@ def _graphs():
     fig.add_hline(y=1000, line_dash='dash', line_color='#888',
                   annotation_text='1g (1000mg)', row=2, col=1)
 
+    # 타임라인 이벤트 수직선
+    tl = st.session_state.timeline
+    launch_t = tl.get('launch_t')
+    t0 = st.session_state.t_list[0] if st.session_state.t_list else 0
+    events_on_graph = [
+        (tl.get('launch_t'), '🚀 발사', '#f39c12'),
+        (tl.get('eject_t'),  '💥 사출', '#27ae60'),
+        (tl.get('land_t'),   '🛬 착지', '#8e44ad'),
+    ]
+    for evt_t, label, color in events_on_graph:
+        if evt_t is not None and launch_t is not None:
+            # ms 기준 x축에 맞춰 장치 ms 추정 (rx_time → device ms는 근사값)
+            pass  # 그래프 vline은 device ms 단위가 필요해 생략
+
     fig.update_layout(
         height=520,
         margin=dict(t=40, b=20, l=60, r=20),
@@ -511,9 +633,57 @@ def _eject_ui(src: DataSource):
             st.rerun()
 
 
+def _timeline():
+    """비행 타임라인 — 발사/사출/착지 시각 표시"""
+    tl       = st.session_state.get('timeline', {})
+    launch_t = tl.get('launch_t')
+    eject_t  = tl.get('eject_t')
+    land_t   = tl.get('land_t')
+
+    def wall(t: Optional[float]) -> str:
+        """epoch → HH:MM:SS.ms"""
+        if not t:
+            return '—'
+        dt = datetime.fromtimestamp(t)
+        return dt.strftime('%H:%M:%S.') + f'{dt.microsecond // 1000:03d}'
+
+    def rel(t: Optional[float]) -> str:
+        """발사 기준 상대 시각 (T+Xs)"""
+        if t is None or launch_t is None:
+            return ''
+        return f' &nbsp; T+{t - launch_t:.2f}s'
+
+    st.markdown("#### 비행 타임라인")
+
+    events = [
+        ('🚀', '발사 감지', launch_t, '#f39c12'),
+        ('💥', '사출',      eject_t,  '#27ae60'),
+        ('🛬', '착지',      land_t,   '#8e44ad'),
+    ]
+    for icon, label, t, color in events:
+        done      = t is not None
+        bar_color = color if done else '#444'
+        time_html = (f'<code>{wall(t)}</code><span style="color:{color}">'
+                     f'{rel(t)}</span>') if done else '<code>—</code>'
+        st.markdown(
+            f'<div style="border-left:4px solid {bar_color};'
+            f'padding:8px 0 8px 12px;margin:5px 0;border-radius:0 4px 4px 0;">'
+            f'<b>{icon} {label}</b>: {time_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+    if launch_t:
+        elapsed = time.time() - launch_t
+        st.caption(f"현재 비행 시간: **T+{elapsed:.1f}s**")
+    else:
+        st.caption("발사 감지 대기 중…")
+
+
 # ─── 메인 ─────────────────────────────────────────────────────────────────────
 def main():
     _init()
+    _sidebar_connection()
+
     src: DataSource = st.session_state.source
     now = time.time()
 
@@ -544,6 +714,26 @@ def main():
         st.session_state.acc_list.append(pkt.acc[2])
 
         _write_log(pkt)
+
+        # ── 비행 타임라인 이벤트 감지 (엣지 트리거) ──────────────────────────
+        prev_mode  = st.session_state.prev_mode
+        prev_eject = st.session_state.prev_eject
+        tl         = st.session_state.timeline
+
+        # 발사: 이전 모드가 0 또는 1이었다가 2로 전환
+        if pkt.flight_mode == 2 and prev_mode in (0, 1, -1) and tl['launch_t'] is None:
+            tl['launch_t'] = pkt.rx_time
+
+        # 사출: eject_state 0→1 첫 전환
+        if pkt.eject_state == 1 and prev_eject == 0 and tl['eject_t'] is None:
+            tl['eject_t'] = pkt.rx_time
+
+        # 착지: mode 4 첫 진입
+        if pkt.flight_mode == 4 and prev_mode != 4 and tl['land_t'] is None:
+            tl['land_t'] = pkt.rx_time
+
+        st.session_state.prev_mode  = pkt.flight_mode
+        st.session_state.prev_eject = pkt.eject_state
 
         # 히스토리 상한 유지 (오래된 앞쪽 제거)
         if len(st.session_state.t_list) > HISTORY_MAX:
@@ -598,15 +788,16 @@ def main():
     _graphs()
     st.divider()
 
-    # ── 하단: 비상 제어 + 패킷 상세 ──────────────────────────────────────────
+    # ── 하단: 비상 제어 + 패킷 상세 + 타임라인 ───────────────────────────────
     col_ctrl, col_pkt = st.columns([1, 2])
 
     with col_ctrl:
         st.subheader("비상 제어")
         _eject_ui(src)
         st.write("")
-        if st.button("ACK 전송", use_container_width=True):
+        if st.button("통신 확인 (Ping)", use_container_width=True):
             src.send_ack()
+        st.caption("로켓과 통신 상태 확인")
 
     with col_pkt:
         if last:
@@ -622,6 +813,9 @@ def main():
                 f"총 수신={st.session_state.total_pkts}",
                 language="text",
             )
+
+        st.divider()
+        _timeline()
 
     # ── 5Hz 자동 갱신 ────────────────────────────────────────────────────────
     time.sleep(REFRESH_MS / 1000.0)
