@@ -1,0 +1,632 @@
+"""
+RUDDER 2026 GCS — Streamlit 기반 지상국 소프트웨어
+
+작년 실패 반영 (gpt_1차코드_피드백.txt):
+  - SEQ 기반 패킷 손실 카운터 (#12 중복수신 대응)
+  - ACK 수신 표시 (#6 CRC/ACK 미보장 대응)
+  - 비상 사출 2단계 확인 (#13 오입력 방지)
+  - 수신 패킷 전체 CSV 로그 저장
+  - BMP 실패(-1) 처리 (그래프 끊김으로 표시)
+  - 데이터 소스 추상화: VirtualFlightSource → SerialSikSource 교체 가능
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import time
+import math
+import random
+import threading
+import queue
+import csv
+import struct
+import pathlib
+from datetime import datetime
+from dataclasses import dataclass, field
+from typing import Optional, List
+from abc import ABC, abstractmethod
+
+# ─── 상수 (Config.h / ModeManager.h 동기화) ──────────────────────────────────
+FLIGHT_MODES = {0: "대기", 1: "Armed", 2: "비행", 3: "사출완료", 4: "착지"}
+MODE_COLORS  = {
+    0: "#555",
+    1: "#e67e22",
+    2: "#2980b9",
+    3: "#27ae60",
+    4: "#8e44ad",
+}
+STATUS_BMP = 0x01
+STATUS_IMU = 0x02
+STATUS_SD  = 0x04
+STATUS_INA = 0x08
+
+HISTORY_MAX  = 700          # 보관 최대 포인트 (~140s @ 5Hz)
+REFRESH_MS   = 200          # UI 갱신 주기 [ms]
+
+# ─── 패킷 포맷 (Packet.h __attribute__((packed)) 동일) ────────────────────────
+#   stx   from  seq   id    len   ms      acc[3]        gyro[3]
+#   H     B     H     B     H     I       hhh           hhh
+#   pressure  bmp_temp  altitude_cm  voltage_mv  current_ma
+#   i         h         i            h           h
+#   flight_mode  eject_state  system_status  pkt_no  crc16  etx
+#   B            B            B              H       H      H
+PKT_FMT  = '<HBHBHIhhhhhhihihhBBBHHH'
+PKT_SIZE = struct.calcsize(PKT_FMT)   # 47 bytes
+
+
+@dataclass
+class Pkt:
+    stx:           int = 0xAA55
+    from_id:       int = 1
+    seq:           int = 0
+    id:            int = 1
+    length:        int = 0
+    ms:            int = 0
+    acc:           List[int] = field(default_factory=lambda: [0, 0, 0])  # [mg]
+    gyro:          List[int] = field(default_factory=lambda: [0, 0, 0])  # [0.1 dps]
+    pressure:      int = 101325   # [Pa]
+    bmp_temp:      int = 2500     # [0.01 °C]
+    altitude_cm:   int = 0        # [cm], -1 = BMP 실패
+    voltage_mv:    int = 7400     # [mV]
+    current_ma:    int = 500      # [mA]
+    flight_mode:   int = 0        # 0~4
+    eject_state:   int = 0        # 0=대기, 1=사출완료
+    system_status: int = 0x0F    # STATUS_BMP|IMU|SD|INA
+    pkt_no:        int = 0
+    crc16:         int = 0
+    etx:           int = 0x55AA
+    rx_time:       float = 0.0    # GCS 수신 시각 (epoch)
+    ack_received:  bool = False
+
+
+# ─── 데이터 소스 추상 클래스 ──────────────────────────────────────────────────
+class DataSource(ABC):
+    @abstractmethod
+    def start(self): ...
+
+    @abstractmethod
+    def stop(self): ...
+
+    @abstractmethod
+    def read_packet(self) -> Optional[Pkt]: ...
+
+    @abstractmethod
+    def send_ack(self): ...
+
+    @abstractmethod
+    def send_force_eject(self): ...
+
+
+# ─── 가상 비행 시뮬레이터 ─────────────────────────────────────────────────────
+class VirtualFlightSource(DataSource):
+    """
+    Config.h 기반 가상 비행 (2026-06-30 팀 합의 수치):
+      최고고도 271m / 8.51s / 총비행 68s
+      텔레메트리 5Hz (TELEM_INTERVAL_MS=200)
+      패킷 손실 5% 시뮬레이션
+    """
+    MAX_ALT_M  = 271.0
+    APOGEE_T   = 8.51
+    FLIGHT_DUR = 68.0
+    # 시나리오: 0~5s 대기, 5~10s Armed(baseline), 10s~ 발사
+    T_ARMED  = 5.0
+    T_LAUNCH = 10.0
+
+    def __init__(self):
+        self._q: queue.Queue    = queue.Queue(maxsize=100)
+        self._running           = False
+        self._thread: Optional[threading.Thread] = None
+        self._seq               = 0
+        self._pkt_no            = 0
+        self._ack_pending       = False
+        self._force_eject       = False
+
+    def start(self):
+        self._running = True
+        self._t0 = time.monotonic()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def send_ack(self):
+        self._ack_pending = True
+
+    def send_force_eject(self):
+        self._force_eject = True
+
+    def read_packet(self) -> Optional[Pkt]:
+        try:
+            return self._q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _profile(self, tf: float):
+        """발사 후 tf초의 (고도[m], Z가속도[mg]) 반환"""
+        T, H = self.APOGEE_T, self.MAX_ALT_M
+        if tf <= 0:
+            return 0.0, 1000
+        if tf <= T:
+            alt = H * (1 - ((tf - T) / T) ** 2)
+            if tf < 5.0:
+                # 부스트: 최대 ~3.5g
+                acc_z = 1000 + int(2500 * math.sin(tf / 5.0 * math.pi))
+            else:
+                # 코스트: 드래그+중력
+                acc_z = -int(200 + 80 * (tf - 5.0))
+        else:
+            ratio = max(0.0, (self.FLIGHT_DUR - tf) / (self.FLIGHT_DUR - T))
+            alt   = H * ratio ** 0.55
+            if tf > self.FLIGHT_DUR - 2:
+                acc_z = 1000 + random.randint(-120, 120)  # 착지 충격
+            else:
+                acc_z = -int(80 + 30 * random.random())   # 낙하산 하강
+        return max(0.0, alt), max(-32768, min(32767, acc_z))
+
+    def _loop(self):
+        ejected = False
+        while self._running:
+            el = time.monotonic() - self._t0
+            tf = el - self.T_LAUNCH   # 발사 후 경과 시간
+
+            # 모드 전환
+            if el < self.T_ARMED:
+                mode = 0
+            elif el < self.T_LAUNCH:
+                mode = 1
+            elif tf >= self.FLIGHT_DUR:
+                mode = 4
+            else:
+                mode = 2
+
+            if self._force_eject and not ejected:
+                ejected = True
+
+            alt_m, acc_z = self._profile(tf)
+
+            # 자동 사출 (정점 도달 후)
+            if mode == 2 and tf >= self.APOGEE_T and not ejected:
+                ejected = True
+
+            if ejected and mode == 2:
+                mode = 3
+
+            self._seq    = (self._seq + 1) & 0xFFFF
+            self._pkt_no = (self._pkt_no + 1) & 0xFFFF
+            ack, self._ack_pending = self._ack_pending, False
+
+            alt_cm = int(alt_m * 100) + random.randint(-20, 20)
+
+            pkt = Pkt(
+                seq          = self._seq,
+                ms           = int(el * 1000),
+                acc          = [
+                    random.randint(-60, 60),
+                    random.randint(-60, 60),
+                    acc_z + random.randint(-50, 50),
+                ],
+                gyro         = [random.randint(-5, 5) for _ in range(3)],
+                pressure     = int(101325 - alt_m * 12.2),
+                bmp_temp     = int(2500 - alt_m * 0.65),
+                altitude_cm  = alt_cm,
+                voltage_mv   = 7400 - int(el * 0.4),
+                current_ma   = 500 + random.randint(-20, 20),
+                flight_mode  = mode,
+                eject_state  = int(ejected),
+                system_status = 0x0F,
+                pkt_no       = self._pkt_no,
+                rx_time      = time.time(),
+                ack_received = ack,
+            )
+
+            # 5% 패킷 손실 시뮬레이션
+            if random.random() > 0.05:
+                try:
+                    self._q.put_nowait(pkt)
+                except queue.Full:
+                    pass
+
+            time.sleep(0.2)  # 5Hz
+
+
+# ─── pyserial SiK 소스 ────────────────────────────────────────────────────────
+class SerialSikSource(DataSource):
+    """
+    실제 SiK 라디오 수신. 교체 방법:
+        src = SerialSikSource(port='COM3', baud=57600)
+    STX=0xAA55 기준으로 패킷 동기화, PKT_FMT 그대로 파싱.
+    """
+    def __init__(self, port: str = 'COM3', baud: int = 57600):
+        self._port  = port
+        self._baud  = baud
+        self._ser   = None
+        self._q: queue.Queue = queue.Queue(maxsize=200)
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        import serial
+        self._ser = serial.Serial(self._port, self._baud, timeout=0.05)
+        self._running = True
+        self._thread = threading.Thread(target=self._rx_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+        if self._ser:
+            self._ser.close()
+
+    def send_ack(self):
+        if self._ser and self._ser.is_open:
+            self._ser.write(struct.pack('<BB', 0xAC, 0x00))
+
+    def send_force_eject(self):
+        if self._ser and self._ser.is_open:
+            self._ser.write(struct.pack('<BB', 0xF0, 0xFF))
+
+    def read_packet(self) -> Optional[Pkt]:
+        try:
+            return self._q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _rx_loop(self):
+        buf = b''
+        STX_BYTES = struct.pack('<H', 0xAA55)
+        while self._running:
+            try:
+                buf += self._ser.read(256)
+                while len(buf) >= PKT_SIZE:
+                    idx = buf.find(STX_BYTES)
+                    if idx < 0:
+                        buf = buf[-4:]
+                        break
+                    if idx > 0:
+                        buf = buf[idx:]
+                    if len(buf) < PKT_SIZE:
+                        break
+                    raw, buf = buf[:PKT_SIZE], buf[PKT_SIZE:]
+                    pkt = _parse_raw(raw)
+                    if pkt:
+                        try:
+                            self._q.put_nowait(pkt)
+                        except queue.Full:
+                            pass
+            except Exception:
+                time.sleep(0.05)
+
+
+def _parse_raw(raw: bytes) -> Optional[Pkt]:
+    """raw bytes → Pkt. STX/ETX 불일치 시 None."""
+    try:
+        v = struct.unpack_from(PKT_FMT, raw)
+        if v[0] != 0xAA55 or v[-1] != 0x55AA:
+            return None
+        return Pkt(
+            stx=v[0], from_id=v[1], seq=v[2], id=v[3], length=v[4], ms=v[5],
+            acc=list(v[6:9]), gyro=list(v[9:12]),
+            pressure=v[12], bmp_temp=v[13], altitude_cm=v[14],
+            voltage_mv=v[15], current_ma=v[16],
+            flight_mode=v[17], eject_state=v[18], system_status=v[19],
+            pkt_no=v[20], crc16=v[21],
+            rx_time=time.time(),
+        )
+    except Exception:
+        return None
+
+
+# ─── 로그 관리 ────────────────────────────────────────────────────────────────
+_LOG_DIR    = pathlib.Path(__file__).parent / 'logs'
+_LOG_FIELDS = [
+    'rx_time', 'seq', 'pkt_no', 'ms',
+    'flight_mode', 'eject_state', 'altitude_cm',
+    'acc_x', 'acc_y', 'acc_z',
+    'gyro_x', 'gyro_y', 'gyro_z',
+    'pressure', 'bmp_temp', 'voltage_mv', 'current_ma',
+    'system_status', 'ack_received', 'crc16',
+]
+
+
+def _open_log():
+    _LOG_DIR.mkdir(exist_ok=True)
+    ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+    path = _LOG_DIR / f'gcs_{ts}.csv'
+    f    = open(path, 'w', newline='', encoding='utf-8')
+    w    = csv.DictWriter(f, fieldnames=_LOG_FIELDS)
+    w.writeheader()
+    f.flush()
+    return str(path), f, w
+
+
+def _write_log(pkt: Pkt):
+    w: Optional[csv.DictWriter] = st.session_state.get('log_writer')
+    f = st.session_state.get('log_file')
+    if w is None:
+        return
+    w.writerow({
+        'rx_time':       f'{pkt.rx_time:.3f}',
+        'seq':           pkt.seq,
+        'pkt_no':        pkt.pkt_no,
+        'ms':            pkt.ms,
+        'flight_mode':   pkt.flight_mode,
+        'eject_state':   pkt.eject_state,
+        'altitude_cm':   pkt.altitude_cm,
+        'acc_x':         pkt.acc[0],
+        'acc_y':         pkt.acc[1],
+        'acc_z':         pkt.acc[2],
+        'gyro_x':        pkt.gyro[0],
+        'gyro_y':        pkt.gyro[1],
+        'gyro_z':        pkt.gyro[2],
+        'pressure':      pkt.pressure,
+        'bmp_temp':      pkt.bmp_temp,
+        'voltage_mv':    pkt.voltage_mv,
+        'current_ma':    pkt.current_ma,
+        'system_status': hex(pkt.system_status),
+        'ack_received':  pkt.ack_received,
+        'crc16':         hex(pkt.crc16),
+    })
+    if f:
+        f.flush()
+
+
+# ─── Streamlit 페이지 설정 ────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="RUDDER GCS 2026",
+    layout="wide",
+    page_icon="🚀",
+)
+
+
+def _init():
+    """세션 최초 1회 초기화"""
+    if st.session_state.get('ready'):
+        return
+    st.session_state.ready = True
+
+    src = VirtualFlightSource()
+    src.start()
+    st.session_state.source     = src
+    st.session_state.t_list:    List[float]          = []
+    st.session_state.alt_list:  List[Optional[float]] = []
+    st.session_state.acc_list:  List[float]          = []
+    st.session_state.last_seq   = -1
+    st.session_state.lost_pkts  = 0
+    st.session_state.total_pkts = 0
+    st.session_state.rate_ts:   List[float]          = []   # 1초 윈도우
+    st.session_state.last_pkt:  Optional[Pkt]        = None
+    st.session_state.eject_phase   = 0      # 0=정상, 1=1차 클릭 대기
+    st.session_state.eject_click_t = 0.0
+
+    path, f, w = _open_log()
+    st.session_state.log_path   = path
+    st.session_state.log_file   = f
+    st.session_state.log_writer = w
+
+
+# ─── UI 컴포넌트 ──────────────────────────────────────────────────────────────
+def _mode_badge(mode: int):
+    name  = FLIGHT_MODES.get(mode, "?")
+    color = MODE_COLORS.get(mode, "#555")
+    st.markdown(
+        f'<div style="background:{color};border-radius:12px;padding:22px 10px;'
+        f'text-align:center;margin-bottom:8px">'
+        f'<span style="color:#fff;font-size:52px;font-weight:900;'
+        f'letter-spacing:2px;text-shadow:0 2px 8px rgba(0,0,0,.4)">'
+        f'{name}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _sensor_dots(status: int):
+    def dot(ok: bool, label: str) -> str:
+        c = '#2ecc71' if ok else '#e74c3c'
+        return f'<span style="color:{c};font-size:20px">●</span> {label}'
+
+    st.markdown(
+        dot(bool(status & STATUS_BMP), 'BMP') + ' &nbsp; ' +
+        dot(bool(status & STATUS_IMU), 'IMU') + ' &nbsp; ' +
+        dot(bool(status & STATUS_SD),  'SD')  + ' &nbsp; ' +
+        dot(bool(status & STATUS_INA), 'INA'),
+        unsafe_allow_html=True,
+    )
+
+
+def _graphs():
+    ts  = st.session_state.t_list
+    alt = st.session_state.alt_list
+    acc = st.session_state.acc_list
+
+    if not ts:
+        st.info("데이터 수신 대기 중…")
+        return
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        subplot_titles=["고도 [m]", "Z축 가속도 [mg]"],
+        vertical_spacing=0.12, row_heights=[0.55, 0.45],
+    )
+    fig.add_trace(
+        go.Scatter(x=ts, y=alt, mode='lines', name='고도',
+                   line=dict(color='#3498db', width=2),
+                   connectgaps=False),   # BMP 실패(-1→None) 구간 끊김
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=ts, y=acc, mode='lines', name='acc_z',
+                   line=dict(color='#e74c3c', width=1.5)),
+        row=2, col=1,
+    )
+    # 1g 기준선
+    fig.add_hline(y=1000, line_dash='dash', line_color='#888',
+                  annotation_text='1g (1000mg)', row=2, col=1)
+
+    fig.update_layout(
+        height=520,
+        margin=dict(t=40, b=20, l=60, r=20),
+        showlegend=False,
+        plot_bgcolor='#111',
+        paper_bgcolor='#0e1117',
+        font=dict(color='#eee'),
+    )
+    fig.update_xaxes(title_text='경과 시간 [s]', row=2, col=1,
+                     gridcolor='#333', showgrid=True)
+    fig.update_yaxes(gridcolor='#333', showgrid=True)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _eject_ui(src: DataSource):
+    """비상 사출 버튼 — 2단계 확인 (오입력 방지, 피드백 #13)"""
+    phase = st.session_state.eject_phase
+
+    if phase == 0:
+        if st.button("⚠️ 비상 사출", use_container_width=True,
+                     type="primary", key="eject_arm"):
+            st.session_state.eject_phase    = 1
+            st.session_state.eject_click_t  = time.time()
+            st.rerun()
+    else:
+        elapsed   = time.time() - st.session_state.eject_click_t
+        remaining = 5.0 - elapsed
+
+        if remaining <= 0:
+            st.session_state.eject_phase = 0
+            st.rerun()
+
+        st.error(f"⚠️ {remaining:.1f}초 안에 확인 버튼 클릭 — 취소하려면 [취소]")
+        c1, c2 = st.columns(2)
+
+        if c1.button("🔴 사출 실행 확인", use_container_width=True,
+                     key="eject_confirm"):
+            src.send_force_eject()
+            st.session_state.eject_phase = 0
+            st.toast("비상 사출 명령 전송됨!", icon="🚨")
+
+        if c2.button("취소", use_container_width=True, key="eject_cancel"):
+            st.session_state.eject_phase = 0
+            st.rerun()
+
+
+# ─── 메인 ─────────────────────────────────────────────────────────────────────
+def main():
+    _init()
+    src: DataSource = st.session_state.source
+    now = time.time()
+
+    # ── 패킷 드레인 & 처리 ───────────────────────────────────────────────────
+    while True:
+        pkt = src.read_packet()
+        if pkt is None:
+            break
+
+        # SEQ 기반 손실 카운터 (피드백 #12: 누락·중복 모두 추적)
+        if st.session_state.last_seq >= 0:
+            expected = (st.session_state.last_seq + 1) & 0xFFFF
+            if pkt.seq != expected:
+                gap = (pkt.seq - expected) & 0xFFFF
+                if gap < 0x8000:   # 역방향 래핑 방지
+                    st.session_state.lost_pkts += gap
+
+        st.session_state.last_seq    = pkt.seq
+        st.session_state.last_pkt    = pkt
+        st.session_state.total_pkts += 1
+        st.session_state.rate_ts.append(now)
+
+        t_sec = pkt.ms / 1000.0
+        st.session_state.t_list.append(t_sec)
+        # altitude_cm == -1 은 BMP 실패 → None으로 변환 (그래프 공백)
+        alt_m = pkt.altitude_cm / 100.0 if pkt.altitude_cm != -1 else None
+        st.session_state.alt_list.append(alt_m)
+        st.session_state.acc_list.append(pkt.acc[2])
+
+        _write_log(pkt)
+
+        # 히스토리 상한 유지 (오래된 앞쪽 제거)
+        if len(st.session_state.t_list) > HISTORY_MAX:
+            st.session_state.t_list.pop(0)
+            st.session_state.alt_list.pop(0)
+            st.session_state.acc_list.pop(0)
+
+    # 1초 윈도우 레이트 계산
+    st.session_state.rate_ts = [t for t in st.session_state.rate_ts
+                                 if now - t < 1.0]
+    pkt_rate = len(st.session_state.rate_ts)
+    last: Optional[Pkt] = st.session_state.last_pkt
+
+    # ── 헤더 ─────────────────────────────────────────────────────────────────
+    hc1, hc2 = st.columns([4, 2])
+    hc1.markdown("## 🚀 RUDDER 2026 지상국 (GCS)")
+    hc2.caption(f"로그 저장 중: `{pathlib.Path(st.session_state.log_path).name}`")
+    st.divider()
+
+    # ── 상단: 모드 배지 + 텔레메트리 수치 ───────────────────────────────────
+    col_mode, col_tele = st.columns([2, 5])
+
+    with col_mode:
+        _mode_badge(last.flight_mode if last else 0)
+        if last and last.eject_state:
+            st.error("🔻 사출 완료")
+        if last:
+            _sensor_dots(last.system_status)
+
+    with col_tele:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("패킷 수신율", f"{pkt_rate} pkt/s",
+                  help="최근 1초 이내 수신 패킷 수")
+        m2.metric("패킷 손실",   f"{st.session_state.lost_pkts} 개",
+                  help="SEQ 번호 기반 누락 패킷 수 (작년 실패 반영)")
+        m3.metric("총 수신",     f"{st.session_state.total_pkts} 개")
+        ack_label = "✅ 수신됨" if (last and last.ack_received) else "⏳ 대기"
+        m4.metric("ACK", ack_label)
+
+        if last:
+            n1, n2, n3, n4 = st.columns(4)
+            alt_str = (f"{last.altitude_cm / 100:.1f} m"
+                       if last.altitude_cm != -1 else "BMP 오류")
+            n1.metric("고도",   alt_str)
+            n2.metric("전압",   f"{last.voltage_mv / 1000:.2f} V")
+            n3.metric("전류",   f"{last.current_ma} mA")
+            n4.metric("온도",   f"{last.bmp_temp / 100:.1f} °C")
+
+    st.divider()
+
+    # ── 실시간 그래프 ─────────────────────────────────────────────────────────
+    _graphs()
+    st.divider()
+
+    # ── 하단: 비상 제어 + 패킷 상세 ──────────────────────────────────────────
+    col_ctrl, col_pkt = st.columns([1, 2])
+
+    with col_ctrl:
+        st.subheader("비상 제어")
+        _eject_ui(src)
+        st.write("")
+        if st.button("ACK 전송", use_container_width=True):
+            src.send_ack()
+
+    with col_pkt:
+        if last:
+            st.subheader("마지막 수신 패킷")
+            st.code(
+                f"SEQ={last.seq}  PKT_NO={last.pkt_no}  MS={last.ms / 1000:.2f}s\n"
+                f"acc   X={last.acc[0]:+6d}  Y={last.acc[1]:+6d}  Z={last.acc[2]:+6d} [mg]\n"
+                f"gyro  X={last.gyro[0]:+5d}  Y={last.gyro[1]:+5d}  Z={last.gyro[2]:+5d} [0.1dps]\n"
+                f"pressure={last.pressure} Pa  bmp_temp={last.bmp_temp / 100:.2f} °C\n"
+                f"MODE={last.flight_mode} ({FLIGHT_MODES[last.flight_mode]})  "
+                f"EJECT={last.eject_state}  STATUS=0x{last.system_status:02X}\n"
+                f"SEQ 손실 누적={st.session_state.lost_pkts}  "
+                f"총 수신={st.session_state.total_pkts}",
+                language="text",
+            )
+
+    # ── 5Hz 자동 갱신 ────────────────────────────────────────────────────────
+    time.sleep(REFRESH_MS / 1000.0)
+    st.rerun()
+
+
+if __name__ == '__main__':
+    main()
