@@ -1,20 +1,22 @@
 """
-RUDDER 2026 — GCS version3 (version3 펌웨어 전용, 기존 gcs.py는 보존)
+RUDDER 2026 — GCS version4 (version4 펌웨어 전용, 기존 gcs.py는 보존)
 
 version2 GCS에서 검증된 구조(수신 스레드, SEQ 손실 집계, 재부팅 감지, CSV 로그)를
 유지하면서 다음을 추가/변경:
 
   1. 모드 5단계 새 의미: 0 대기 / 1 준비 / 2 비행(발사감지됨) / 3 낙하 / 4 착륙
      → 모드가 실제 사건과 1:1이라 GCS 표시가 곧 로켓의 진실
-  2. 모드 전환 수동 버튼 전부: 대기/준비/강제비행/강제착륙 + 비상사출(2단계 확인)
+  2. 모드 전환 버튼은 정해진 출발 모드에서만 활성화 (준비→대기, 대기→준비,
+     준비→비행, 낙하→착륙) + 비상사출/강제비행 둘 다 2단계 확인
   3. 비상사출 자동 재전송: 확인 클릭 1회 → 0.3초 간격 자동 반복 →
-     로켓이 보고하는 cmd_rx_count(명령 수신 카운터) 증가 확인 시 자동 중지
+     로켓이 보고하는 eject_state가 0→1로 바뀌면(=실제 사출 확인) 자동 중지
      화면에 "전송 N회 / 로켓 수신 확인" 표시. [중단] 버튼으로 취소 가능
   4. 텔레메트리 CRC16 검증 — 손상 패킷은 버리고 개수만 집계
-  5. 깜빡임 최소화: 전체 rerun 없음, 수치는 0.3초/그래프는 1초 부분 갱신,
+  5. 서보 전원 ON/OFF 표시 (MOSFET 신호/모드 기준 — 실제 전류 실측 아님)
+  6. 깜빡임 최소화: 전체 rerun 없음, 수치는 0.3초/그래프는 1초 부분 갱신,
      그래프 컴포넌트 재사용(key 고정)
 
-실행:  python -m streamlit run gcs_v3.py
+실행:  python -m streamlit run gcs_v4.py
 """
 
 import streamlit as st
@@ -28,7 +30,7 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional, List
 
-# ─── 상수 (version3 Config.h / Packet.h와 동기화) ────────────────────────────
+# ─── 상수 (version4 Config.h / Packet.h와 동기화) ────────────────────────────
 FLIGHT_MODES = {0: "대기", 1: "준비", 2: "비행", 3: "낙하", 4: "착륙"}
 MODE_COLORS  = {0: "#555", 1: "#e67e22", 2: "#2980b9", 3: "#27ae60", 4: "#8e44ad"}
 
@@ -195,7 +197,7 @@ LOG_FIELDS = ['rx_time', 'seq', 'ms', 'flight_mode', 'eject_state', 'altitude_cm
 
 def open_log():
     LOG_DIR.mkdir(exist_ok=True)
-    path = LOG_DIR / f"gcs_v3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    path = LOG_DIR / f"gcs_v4_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     f = open(path, 'w', newline='', encoding='utf-8')
     w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
     w.writeheader()
@@ -222,7 +224,7 @@ def write_log(pkt: Pkt):
 
 
 # ─── Streamlit ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="RUDDER GCS v3", layout="wide", page_icon="🚀")
+st.set_page_config(page_title="RUDDER GCS v4", layout="wide", page_icon="🚀")
 
 
 def _init():
@@ -244,7 +246,9 @@ def _init():
     st.session_state.eject_phase = 0          # 0=대기 1=확인대기 2=재전송중
     st.session_state.eject_click_t = 0.0
     st.session_state.retry_sent = 0
-    st.session_state.retry_baseline = 0
+    # 강제비행 진입 확인 (되돌릴 수 없는 명령이라 비상사출과 동일하게 확인 단계를 둠)
+    st.session_state.ff_confirm  = False
+    st.session_state.ff_click_t  = 0.0
     path, f, w = open_log()
     st.session_state.log_path = path
     st.session_state.log_file = f
@@ -356,6 +360,12 @@ def _panel():
                 dot(s & STATUS_BMP, 'BMP') + ' ' + dot(s & STATUS_IMU, 'IMU') + ' ' +
                 dot(s & STATUS_SD, 'SD') + ' ' + dot(s & STATUS_INA, 'INA'),
                 unsafe_allow_html=True)
+            servo_on = mode != 0
+            st.markdown(
+                f'<span style="color:{"#2ecc71" if servo_on else "#888"};">●</span> '
+                f'서보 전원 {"ON" if servo_on else "OFF"}',
+                unsafe_allow_html=True)
+            st.caption("MOSFET 신호(명령) 기준 — 실제 전류 실측 아님")
             if last.eject_state:
                 st.error("🪂 사출 완료")
 
@@ -379,18 +389,38 @@ def _panel():
     # ── 명령 패널 ──────────────────────────────────────────────
     st.subheader("🎛️ 모드 제어")
     connected = link is not None
+    mode_now = last.flight_mode if last else -1
     b1, b2, b3, b4 = st.columns(4)
-    if b1.button("⚪ 대기 전환", use_container_width=True, disabled=not connected):
+    if b1.button("⚪ 준비→대기 전환", use_container_width=True,
+                 disabled=not connected or mode_now != 1):
         link.send_cmd(CMD_SET_STANDBY)
-    if b2.button("🟠 준비 전환 (기준압 수집)", use_container_width=True, disabled=not connected):
+    if b2.button("🟠 대기→준비 전환 (기준압 수집)", use_container_width=True,
+                 disabled=not connected or mode_now != 0):
         link.send_cmd(CMD_SET_ARMED)
-    if b3.button("🔵 강제 비행 진입", use_container_width=True, disabled=not connected,
-                 help="센서 무관 강제 진입 — 발사감지 실패 시 백업. 10초 타이머 즉시 시작됨"):
-        link.send_cmd(CMD_FORCE_FLIGHT)
-    if b4.button("🟣 강제 착륙 (SD 닫기)", use_container_width=True, disabled=not connected):
+    if b3.button("🔵 준비→비행 강제진입", use_container_width=True,
+                 disabled=not connected or mode_now != 1,
+                 help="센서 무관 강제 진입 — 발사감지 실패 시 백업. 10초 타이머 즉시 시작됨. 되돌릴 수 없음"):
+        st.session_state.ff_confirm = True
+        st.session_state.ff_click_t = now
+    if b4.button("🟣 낙하→착륙 강제전환 (SD 닫기)", use_container_width=True,
+                 disabled=not connected or mode_now != 3):
         link.send_cmd(CMD_FORCE_LAND)
-    st.caption("버튼 클릭 후 위 모드 배지가 바뀌는지로 적용 여부 확인 "
-               "(모드 배지 = 로켓이 실제 보고하는 상태)")
+
+    if st.session_state.ff_confirm:
+        remain = 5.0 - (now - st.session_state.ff_click_t)
+        if remain <= 0:
+            st.session_state.ff_confirm = False
+        else:
+            st.error(f"⚠️ 비행 강제진입은 되돌릴 수 없습니다 — {remain:.1f}초 안에 확인")
+            fc1, fc2 = st.columns(2)
+            if fc1.button("🔴 강제진입 확인", use_container_width=True):
+                link.send_cmd(CMD_FORCE_FLIGHT)
+                st.session_state.ff_confirm = False
+            if fc2.button("취소", use_container_width=True, key="ff_cancel"):
+                st.session_state.ff_confirm = False
+
+    st.caption("버튼은 현재 모드와 맞을 때만 활성화됩니다. 클릭 후 위 모드 배지가 "
+               "바뀌는지로 적용 여부 확인 (모드 배지 = 로켓이 실제 보고하는 상태)")
 
     # ── 비상 사출 (2단계 확인 + 자동 재전송) ───────────────────
     st.subheader("🚨 비상 사출")
@@ -411,13 +441,11 @@ def _panel():
             if cc1.button("🔴 실행 확인", use_container_width=True):
                 st.session_state.eject_phase = 2
                 st.session_state.retry_sent = 0
-                st.session_state.retry_baseline = last.cmd_rx_count if last else 0
                 st.session_state.last_retry_t = 0.0
             if cc2.button("취소", use_container_width=True):
                 st.session_state.eject_phase = 0
     else:  # phase 2: 자동 재전송 중
-        rocket_count = last.cmd_rx_count if last else 0
-        confirmed = rocket_count > st.session_state.retry_baseline
+        confirmed = (last.eject_state == 1) if last else False
 
         if confirmed:
             st.success(f"✅ 로켓이 명령 수신 확인! (전송 {st.session_state.retry_sent}회 만에)")
@@ -429,7 +457,7 @@ def _panel():
                 st.session_state.retry_sent += 1
                 st.session_state.last_retry_t = now
             st.warning(f"📡 자동 재전송 중... 전송 {st.session_state.retry_sent}회 · "
-                       f"로켓 수신 확인 대기 (수신 카운터 {rocket_count})")
+                       f"로켓 사출 확인 대기 (eject_state={last.eject_state if last else '—'})")
             if st.button("🛑 재전송 중단", use_container_width=True):
                 st.session_state.eject_phase = 0
 
@@ -474,7 +502,7 @@ def _charts():
 
 def main():
     _init()
-    st.title("🚀 RUDDER GCS v3")
+    st.title("🚀 RUDDER GCS v4")
     _sidebar()
     _panel()
     _charts()

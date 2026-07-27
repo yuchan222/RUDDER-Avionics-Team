@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  RUDDER 2026 — version3 비행 소프트웨어
+//  RUDDER 2026 — version4 비행 소프트웨어
 //
 //  설계 원칙 (2026-07-22 팀 합의):
 //   1. 모드 = 실제 사건과 1:1 대응 (모드만 봐도 로켓이 뭘 하는지 안다)
@@ -8,6 +8,8 @@
 //   4. 사출 로직은 비행 모드에서만 → 대기/준비는 구조적으로 사출 불가
 //   5. 비상사출은 모드·잠금 전부 무시 (유일한 방어선 = GCS 2단계 확인)
 //   6. 사출 후 서보 목표각 반복 재명령 (일시 실패 대비)
+//   7. 모드 전환 명령은 정해진 출발 모드에서만 허용 (오작동·오전송·지연도착 방지)
+//      단, FORCE_EJECT만 예외 — 모드·잠금 전부 무시
 //
 //  ┌─────────┐ SET_ARMED ┌─────────┐ 발사감지(OR) ┌─────────┐
 //  │ 0 대기  │──────────>│ 1 준비  │─────────────>│ 2 비행  │
@@ -67,7 +69,6 @@ static uint8_t    g_dropCount   = 0;
 
 // 착륙감지 상태
 static uint32_t   g_landStableMs = 0;
-static int32_t    g_lastAltCm    = 0;
 
 // 착륙 처리 1회 플래그
 static bool       g_logClosed   = false;
@@ -97,8 +98,8 @@ static void enterArmed() {
   Serial.println("[MODE] 1 준비 (발사감지 대기)");
 }
 
-static void enterFlight(const char *how) {
-  g_launchMs = millis();
+static void enterFlight(uint32_t now, const char *how) {
+  g_launchMs = now;   // loop()의 now를 그대로 사용 — millis() 재호출 시 값이 갈라지는 것 방지
   g_mode = MODE_FLIGHT;
   Serial.print("[MODE] 2 비행 — 발사 감지 ("); Serial.print(how); Serial.println(")");
 }
@@ -121,25 +122,29 @@ static uint8_t crc8(const uint8_t *d, uint8_t n) {
   return c;
 }
 
-static void handleCommand(uint8_t cmd) {
+static void handleCommand(uint8_t cmd, uint32_t now) {
   g_cmdRxCount++;   // 유효 명령이면 종류 무관 카운트 (GCS 재전송 확인용)
 
   switch (cmd) {
     case CMD_SET_STANDBY:
+      if (g_mode != MODE_ARMED) { Serial.println("[거부] 대기 전환 — 준비 상태에서만 가능"); break; }
       g_mode = MODE_SAFE;
       if (!g_ejected) g_servo.write(SERVO_CLOSED_DEG);
       Serial.println("[MODE] 0 대기");
       break;
     case CMD_SET_ARMED:
+      if (g_mode != MODE_SAFE) { Serial.println("[거부] 준비 전환 — 대기 상태에서만 가능"); break; }
       enterArmed();
       break;
     case CMD_FORCE_FLIGHT:
-      enterFlight("수동 강제");
+      if (g_mode != MODE_ARMED) { Serial.println("[거부] 비행 강제진입 — 준비 상태에서만 가능"); break; }
+      enterFlight(now, "수동 강제");
       break;
     case CMD_FORCE_EJECT:
-      doEject("지상국 비상 명령");   // 모드·잠금 무시, 어디서든
+      doEject("지상국 비상 명령");   // 모드·잠금 무시, 어디서든 (설계상 유일한 예외)
       break;
     case CMD_FORCE_LAND:
+      if (g_mode != MODE_DESCENT) { Serial.println("[거부] 착륙 강제전환 — 낙하 상태에서만 가능"); break; }
       enterLanded();
       break;
     case CMD_SYSRESET:
@@ -151,7 +156,7 @@ static void handleCommand(uint8_t cmd) {
   }
 }
 
-static void pollCommands() {
+static void pollCommands(uint32_t now) {
   static uint8_t buf[8];
   static uint8_t pos = 0;
 
@@ -167,7 +172,7 @@ static void pollCommands() {
       for (uint8_t i = 2; i < 6 && !ok; i++)
         for (uint8_t j = i + 1; j < 6 && !ok; j++)
           if (buf[i] == buf[j]) { cmd = buf[i]; ok = true; }
-      if (ok && buf[6] == crc8(buf, 6)) handleCommand(cmd);
+      if (ok && buf[6] == crc8(buf, 6)) handleCommand(cmd, now);
     }
   }
 }
@@ -182,14 +187,14 @@ static void checkLaunch(uint32_t now) {
   // 경로 A: Z축 가속도 2g 이상 0.3초 연속
   if (imuOk && g_pkt.acc[2] >= LAUNCH_ZACC_MG) {
     if (!g_zaccActive) { g_zaccActive = true; g_zaccStartMs = now; }
-    if (now - g_zaccStartMs >= LAUNCH_ZACC_MS) { enterFlight("가속도 2g/0.3s"); return; }
+    if (now - g_zaccStartMs >= LAUNCH_ZACC_MS) { enterFlight(now, "가속도 2g/0.3s"); return; }
   } else {
     g_zaccActive = false;
   }
 
   // 경로 B: 고도 10m 이상 5회 연속
   if (bmpOk && g_pkt.altitude_cm >= (int32_t)(LAUNCH_ALT_M * 100)) {
-    if (++g_altHitCount >= LAUNCH_ALT_COUNT) { enterFlight("고도 10m"); return; }
+    if (++g_altHitCount >= LAUNCH_ALT_COUNT) { enterFlight(now, "고도 10m"); return; }
   } else {
     g_altHitCount = 0;
   }
@@ -230,25 +235,39 @@ static void checkEjection(uint32_t now) {
 static void checkLanding(uint32_t now) {
   if (g_pkt.altitude_cm == -1) return;   // BMP 실패 시 판단 보류
 
+  // 1초 간격으로 기준고도를 갱신해서 그 사이 변화량으로 판단 (20ms 샘플 간
+  // 비교는 정상 낙하산 하강 속도에서도 항상 "안정"으로 오판되어 공중에서
+  // 착륙 판정이 날 수 있었음 — 1초 단위면 실제 하강속도가 드러남)
+  static uint32_t s_refMs     = 0;
+  static int32_t  s_refAltCm  = 0;
+  static bool     s_altStable = false;
+
+  if (s_refMs == 0) { s_refMs = now; s_refAltCm = g_pkt.altitude_cm; }
+  if (now - s_refMs >= LAND_ALT_WINDOW_MS) {
+    s_altStable = labs(g_pkt.altitude_cm - s_refAltCm) < LAND_ALT_CM_THRESH;
+    s_refAltCm  = g_pkt.altitude_cm;
+    s_refMs     = now;
+  }
+
   float ax = g_pkt.acc[0], ay = g_pkt.acc[1], az = g_pkt.acc[2];
   float netMg = sqrtf(ax * ax + ay * ay + az * az);
-
-  bool altStable = (labs(g_pkt.altitude_cm - g_lastAltCm) < LAND_ALT_CM_THRESH);
   bool accStable = (netMg >= LAND_ACC_MIN_MG && netMg <= LAND_ACC_MAX_MG);
 
-  if (altStable && accStable) {
+  if (s_altStable && accStable) {
     if (g_landStableMs == 0) g_landStableMs = now;
     if (now - g_landStableMs >= LAND_STABLE_MS) enterLanded();
   } else {
     g_landStableMs = 0;
   }
-  g_lastAltCm = g_pkt.altitude_cm;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  setup / loop
 // ═══════════════════════════════════════════════════════════════════════════
 void setup() {
+  pinMode(PIN_ARM_EN, OUTPUT);
+  digitalWrite(PIN_ARM_EN, LOW);   // 부팅 즉시 서보 전원 차단 (기본 안전 — 그 무엇보다 먼저)
+
   Serial.begin(BAUD_USB);
   Serial1.begin(BAUD_TELEMETRY);
   uint32_t t0 = millis();
@@ -261,7 +280,7 @@ void setup() {
   g_sdOk = initSD();
   if (!g_sdOk) Serial.println("[ERR] SD 초기화 실패 — 로깅 없이 진행");
 
-  Serial.print("[BOOT] version3  mode=0 대기  status=0x");
+  Serial.print("[BOOT] version4  mode=0 대기  status=0x");
   Serial.println(sensorStatus() | (g_sdOk ? STATUS_SD : 0), HEX);
   // 재부팅 시 항상 대기 모드에서 시작 (모드 저장/복원 없음 — 단순·안전)
 }
@@ -269,7 +288,9 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  pollCommands();
+  pollCommands(now);
+  // 서보 전원(MOSFET) — 상태기반: 매 루프 현재 모드로 재확정 (전환지점 하나하나 챙길 필요 없음)
+  digitalWrite(PIN_ARM_EN, (g_mode == MODE_SAFE) ? LOW : HIGH);
 
   // ── 50Hz: 계측 + 모드 로직 + 로깅 ─────────────────────────────────────
   static uint32_t lastSensorMs = 0;

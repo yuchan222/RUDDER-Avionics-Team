@@ -11,6 +11,7 @@
 // 상태 확인은 GCS 텔레메트리 + USB 시리얼 로그로 대체
 #define PIN_SERVO        9
 #define PIN_SD_CS       10
+#define PIN_ARM_EN        7   // 서보 전원 MOSFET 게이트 제어 (LOW=차단, HIGH=통전)
 
 // ── 통신 ─────────────────────────────────────────────────────────────────
 #define BAUD_USB       115200
@@ -53,7 +54,8 @@
 
 // ── 착륙 감지 ─────────────────────────────────────────────────────────────
 #define LAND_STABLE_MS     5000    // 조건 5초 유지 시 착륙 판정
-#define LAND_ALT_CM_THRESH  200    // 고도 변화 2m 미만
+#define LAND_ALT_WINDOW_MS 1000    // 이 주기로 기준고도 갱신 (20ms 간격 비교는 항상 안정으로 오판됨)
+#define LAND_ALT_CM_THRESH  100    // 위 주기(1초) 동안 고도 변화 1m 미만
 #define LAND_ACC_MIN_MG     800    // 합가속도 0.8g ~
 #define LAND_ACC_MAX_MG    1200    //           1.2g (정지 상태 ≈ 1g)
 
