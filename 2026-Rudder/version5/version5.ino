@@ -301,7 +301,8 @@ void loop() {
     g_pkt.flight_mode   = g_mode;
     g_pkt.eject_state   = g_ejected ? 1 : 0;
     g_pkt.system_status = sensorStatus() | (g_sdOk ? STATUS_SD : 0)
-                         | (g_baselineOk ? 0 : STATUS_BASELINE_BAD);
+                         | (g_baselineOk ? 0 : STATUS_BASELINE_BAD)
+                         | (g_logClosed ? STATUS_LOG_CLOSED : 0);
     g_pkt.cmd_rx_count  = g_cmdRxCount;
 
     // 준비~낙하 구간만 SD 기록 (발사 전 데이터부터 착륙까지)

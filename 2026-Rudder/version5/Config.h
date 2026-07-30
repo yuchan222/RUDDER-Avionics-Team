@@ -72,5 +72,6 @@
 #define STATUS_SD    0x04
 #define STATUS_INA   0x08
 #define STATUS_BASELINE_BAD  0x10   // 기준압 수집 45/50 미달 (고도 신뢰 불가)
+#define STATUS_LOG_CLOSED    0x20   // SD 로그 정상 종료됨 (착륙 후)
 
 #endif

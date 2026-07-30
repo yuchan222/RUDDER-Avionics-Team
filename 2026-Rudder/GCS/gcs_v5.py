@@ -33,6 +33,7 @@ MODE_COLORS  = {0: "#555", 1: "#e67e22", 2: "#2980b9", 3: "#27ae60", 4: "#8e44ad
 
 STATUS_BMP, STATUS_IMU, STATUS_SD, STATUS_INA = 0x01, 0x02, 0x04, 0x08
 STATUS_BASELINE_BAD = 0x10
+STATUS_LOG_CLOSED = 0x20
 
 ALT_INVALID = -2147483648   # Config.h의 ALT_INVALID(INT32_MIN)와 동일 — BMP 실패 표시
 
@@ -352,6 +353,7 @@ def _panel():
 
     # ── 모드 배지 + 센서 상태 ───────────────────────────────────
     mode = last.flight_mode if last else 0
+    s = last.system_status if last else 0
     c_badge, c_num = st.columns([2, 5])
     with c_badge:
         st.markdown(
@@ -385,13 +387,22 @@ def _panel():
         m3.metric("손상(CRC)", link.crc_bad if link else 0)
         m4.metric("총 수신", st.session_state.total)
         if last:
-            n1, n2, n3, n4 = st.columns(4)
+            n1, n2, n3, n4, n5 = st.columns(5)
             alt = f"{last.altitude_cm / 100:.1f} m" if last.altitude_cm != ALT_INVALID else "BMP 오류"
             n1.metric("고도", alt)
             n2.metric("전압", f"{last.voltage_mv / 1000:.2f} V" if last.voltage_mv != -1 else "—")
             n3.metric("Z가속도", f"{last.acc[2]} mg")
             n4.metric("명령 수신", last.cmd_rx_count,
                       help="로켓이 지금까지 수신 처리한 유효 명령 개수")
+            if not (s & STATUS_SD):
+                sd_text = "미장착"
+            elif s & STATUS_LOG_CLOSED:
+                sd_text = "종료"
+            elif 1 <= mode <= 3:
+                sd_text = "기록중"
+            else:
+                sd_text = "대기"
+            n5.metric("SD로그", sd_text)
 
     st.divider()
 
