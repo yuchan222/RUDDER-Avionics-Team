@@ -329,7 +329,7 @@ def _panel():
             st.session_state.t_hist.append(pkt.ms / 1000.0)
             st.session_state.alt_hist.append(
                 pkt.altitude_cm / 100.0 if pkt.altitude_cm != ALT_INVALID else None)
-            st.session_state.acc_hist.append(pkt.acc[2])
+            st.session_state.acc_hist.append(pkt.acc[0])   # X축 = 발사 감지축 (2026-07-30 실측 확인)
             if len(st.session_state.t_hist) > HISTORY_MAX:
                 st.session_state.t_hist.pop(0)
                 st.session_state.alt_hist.pop(0)
@@ -391,7 +391,7 @@ def _panel():
             alt = f"{last.altitude_cm / 100:.1f} m" if last.altitude_cm != ALT_INVALID else "BMP 오류"
             n1.metric("고도", alt)
             n2.metric("전압", f"{last.voltage_mv / 1000:.2f} V" if last.voltage_mv != -1 else "—")
-            n3.metric("Z가속도", f"{last.acc[2]} mg")
+            n3.metric("X가속도", f"{last.acc[0]} mg", help="발사 감지축 (2026-07-30 실측 확인)")
             n4.metric("명령 수신", last.cmd_rx_count,
                       help="로켓이 지금까지 수신한 유효 형식(CRC 통과) 명령 프레임 수 — "
                            "모드가 안 맞아 거부된 명령도 포함, '적용됨'의 의미 아님")
@@ -513,7 +513,7 @@ def _charts():
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                        subplot_titles=["고도 [m]", "Z축 가속도 [mg]"],
+                        subplot_titles=["고도 [m]", "X축 가속도 [mg] (발사 감지축)"],
                         vertical_spacing=0.12)
     fig.add_trace(go.Scatter(x=ts, y=st.session_state.alt_hist, mode='lines',
                              line=dict(color='#3498db', width=2), connectgaps=False),
