@@ -197,8 +197,9 @@ static void checkLaunch(uint32_t now) {
   bool imuOk = (sensorStatus() & STATUS_IMU);
   bool bmpOk = (g_pkt.altitude_cm != ALT_INVALID) && g_baselineOk;   // 기준압 자체가 불량이면 고도 경로 안 씀
 
-  // 경로 A: Z축 가속도 2g 이상 0.3초 연속
-  if (imuOk && g_pkt.acc[2] >= LAUNCH_ZACC_MG) {
+  // 경로 A: 세로축(LAUNCH_AXIS) 가속도 2g 이상 0.3초 연속
+  int16_t launchAcc = g_pkt.acc[LAUNCH_AXIS] * LAUNCH_SIGN;
+  if (imuOk && launchAcc >= LAUNCH_ZACC_MG) {
     if (!g_zaccActive) { g_zaccActive = true; g_zaccStartMs = now; }
     if (now - g_zaccStartMs >= LAUNCH_ZACC_MS) { enterFlight(now, "가속도 2g/0.3s"); return; }
   } else {

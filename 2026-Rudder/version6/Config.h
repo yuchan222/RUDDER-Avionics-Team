@@ -38,7 +38,12 @@
 #define TELEM_INTERVAL_MS   200    // 5 Hz 텔레메트리
 
 // ── 발사 감지 (OR 조건: 둘 중 하나만 만족해도 발사 판정) ─────────────────
-#define LAUNCH_ZACC_MG     2000    // 가속도 경로: Z축 2g 이상
+// LAUNCH_AXIS/SIGN: IMU 장착 방향에 따라 로켓 세로축과 일치하는 acc[] 인덱스가
+// 달라짐 (0=X, 1=Y, 2=Z). 2026-07-30 axis_check.ino 실물 흔들기 테스트로 확인:
+// X축(+)이 로켓 상승 방향과 일치함.
+#define LAUNCH_AXIS           0    // acc[] 인덱스 — X축
+#define LAUNCH_SIGN           1    // X축 +방향이 로켓 상승(발사) 방향과 일치
+#define LAUNCH_ZACC_MG     2000    // 가속도 경로: 세로축 2g 이상
 #define LAUNCH_ZACC_MS      300    //              0.3초 연속 유지
 #define LAUNCH_ALT_M       10.0f   // 고도 경로:   10m 이상
 #define LAUNCH_ALT_COUNT      5    //              5회(0.1초) 연속
