@@ -32,6 +32,7 @@
 #define SERVO_EJECT_DEG    30   // 구조상 30도 초과 회전 불가 확인됨 (2026-07-27)
 #define SERVO_RECMD_MS   1000   // 사출 후 목표각 재명령 주기 (회전 실패 대비 반복)
 #define SERVO_RECMD_COUNT   5   // 재명령 최대 횟수 (무기한 반복 방지, 약 5초)
+#define SERVO_CLOSE_HOLD_MS 2000  // 착륙 시 닫힘 위치로 복귀시키는 데 전원 유지하는 시간
 
 // ── 루프 주기 ─────────────────────────────────────────────────────────────
 #define SENSOR_INTERVAL_MS   20    // 50 Hz 계측/로깅
@@ -39,10 +40,10 @@
 
 // ── 발사 감지 (OR 조건: 둘 중 하나만 만족해도 발사 판정) ─────────────────
 // LAUNCH_AXIS/SIGN: IMU 장착 방향에 따라 로켓 세로축과 일치하는 acc[] 인덱스가
-// 달라짐 (0=X, 1=Y, 2=Z). 2026-07-30 axis_check.ino 실물 흔들기 테스트로 확인:
-// X축(+)이 로켓 상승 방향과 일치함.
+// 달라짐 (0=X, 1=Y, 2=Z). 2026-07-30 실제 전 부품 연결 테스트로 부호 반전 확인:
+// X축(-)이 로켓 상승 방향과 일치함.
 #define LAUNCH_AXIS           0    // acc[] 인덱스 — X축
-#define LAUNCH_SIGN           1    // X축 +방향이 로켓 상승(발사) 방향과 일치
+#define LAUNCH_SIGN          -1    // X축 -방향이 로켓 상승(발사) 방향과 일치 (2026-07-30 실측 정정)
 #define LAUNCH_ZACC_MG     2000    // 가속도 경로: 세로축 2g 이상
 #define LAUNCH_ZACC_MS      300    //              0.3초 연속 유지
 #define LAUNCH_ALT_M       10.0f   // 고도 경로:   10m 이상

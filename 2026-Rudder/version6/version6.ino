@@ -73,6 +73,8 @@ static uint8_t    g_peakConfirmCount = 0;   // 최고고도 갱신 연속 확인
 
 // 착륙 처리 1회 플래그
 static bool       g_logClosed   = false;
+static uint32_t   g_landedMs    = 0;      // 착륙 진입 시각 (서보 복귀 유지시간 계산용)
+static bool       g_servoOffDone = false; // 착륙 후 전원차단 완료 여부 (1회만 실행)
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  사출 (한 곳에서만 실행 — 어디서 호출되든 동일 동작)
@@ -117,8 +119,10 @@ static void enterFlight(uint32_t now, const char *how) {
 
 static void enterLanded() {
   g_mode = MODE_LANDED;
-  servoSafeOff();   // 회수 단계 진입 즉시 서보 전원 차단 (무기한 통전 방지)
-  Serial.println("[MODE] 4 착륙");
+  g_landedMs = millis();
+  g_servoOffDone = false;
+  g_servo.write(SERVO_CLOSED_DEG);   // 닫힘 위치로 복귀 시도 — SERVO_CLOSE_HOLD_MS 동안 전원 유지 후 차단
+  Serial.println("[MODE] 4 착륙 — 서보 복귀 중");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -292,8 +296,10 @@ void loop() {
 
   pollCommands(now);
   // 서보 전원(MOSFET) — 상태기반: 매 루프 현재 모드로 재확정 (전환지점 하나하나 챙길 필요 없음)
-  // SAFE·LANDED는 통전 불필요 (LANDED는 회수 단계 — 무기한 통전 방지)
-  digitalWrite(PIN_ARM_EN, (g_mode == MODE_SAFE || g_mode == MODE_LANDED) ? LOW : HIGH);
+  // SAFE는 통전 불필요. LANDED는 닫힘 복귀에 필요한 SERVO_CLOSE_HOLD_MS 동안만 유지하고
+  // 그 뒤(g_servoOffDone)엔 차단 (무기한 통전 방지는 유지, 복귀에 필요한 시간만 예외)
+  bool landedPowerOff = (g_mode == MODE_LANDED && g_servoOffDone);
+  digitalWrite(PIN_ARM_EN, (g_mode == MODE_SAFE || landedPowerOff) ? LOW : HIGH);
 
   // ── 50Hz: 계측 + 모드 로직 + 로깅 ─────────────────────────────────────
   static uint32_t lastSensorMs = 0;
@@ -344,6 +350,13 @@ void loop() {
     lastServoMs = now;
     g_servo.write(SERVO_EJECT_DEG);
     g_servoRecmdLeft--;
+  }
+
+  // ── 착륙 후 서보 복귀 유지시간 경과하면 전원 차단 (1회) ──────────────────
+  if (g_mode == MODE_LANDED && !g_servoOffDone && now - g_landedMs >= SERVO_CLOSE_HOLD_MS) {
+    servoSafeOff();
+    g_servoOffDone = true;
+    Serial.println("[SERVO] 닫힘 복귀 완료 — 전원 차단");
   }
 
   // ── 착륙 후 SD 마무리 (1회) ───────────────────────────────────────────
