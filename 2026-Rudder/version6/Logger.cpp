@@ -48,10 +48,17 @@ void finalizePacket(DataPacket &p) {
   p.crc16 = crc16((const uint8_t*)&p, (uint16_t)offsetof(DataPacket, crc16));
 }
 
-void writePacket(const DataPacket &p) {
-  if (!s_ready) return;
-  s_file.write((const uint8_t*)&p, sizeof(p));
-  if (++s_pktCount % SAMPLES_SYNC == 0) s_file.sync();
+bool writePacket(const DataPacket &p) {
+  if (!s_ready) return false;
+  if (s_file.write((const uint8_t*)&p, sizeof(p)) != sizeof(p)) {
+    s_ready = false;   // 쓰기 실패 즉시 반영 — isLogReady()가 바로 false로 바뀜
+    return false;
+  }
+  if (++s_pktCount % SAMPLES_SYNC == 0 && !s_file.sync()) {
+    s_ready = false;
+    return false;
+  }
+  return true;
 }
 
 void flushLog() { if (s_ready) s_file.sync();  }

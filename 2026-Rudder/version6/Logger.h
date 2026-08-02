@@ -9,7 +9,7 @@
 bool initSD();                           // SD 초기화 + 새 LOGxxxxx.RAW 열기
 bool isLogReady();
 void finalizePacket(DataPacket &p);      // len + CRC16 계산 (저장/송신 직전 호출)
-void writePacket(const DataPacket &p);
+bool writePacket(const DataPacket &p);   // 쓰기/sync 실패 시 false — 그 순간 SD 상태가 바로 반영됨
 void flushLog();
 void closeLog();
 

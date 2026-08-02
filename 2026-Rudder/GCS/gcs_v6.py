@@ -373,8 +373,10 @@ def _panel():
                 unsafe_allow_html=True)
             servo_on = mode != 0
             st.markdown(
-                f'<span style="color:{"#2ecc71" if servo_on else "#888"};">●</span> '
-                f'서보 전원 {"ON" if servo_on else "OFF"}',
+                f'<div style="background:{"#1e7e34" if servo_on else "#3a3a3a"};'
+                f'border-radius:10px;padding:10px 8px;text-align:center;margin-top:8px;">'
+                f'<span style="color:#fff;font-size:24px;font-weight:900;">'
+                f'⚡ 서보 전원 {"ON" if servo_on else "OFF"}</span></div>',
                 unsafe_allow_html=True)
             st.caption("MOSFET 신호(명령) 기준 — 실제 전류 실측 아님")
             if last.eject_state:

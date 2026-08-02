@@ -11,9 +11,11 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 static bool s_imuOk    = false;
+static uint8_t s_imuAddr = IMU_ADDR;   // 실제 응답하는 주소로 부팅 시 자동 확정됨 (AD0 핀 상태에 따라 0x68/0x69)
 static bool s_bmpOk    = false;   // 최근 읽기 성공 여부 (매 readSensors마다 갱신 — 상태점 최신성 유지)
 static bool s_bmpInited = false;  // 부팅 시 초기화 성공 여부 (고정, 읽기 재시도 가능 여부 판단용)
-static bool s_inaOk    = false;
+static bool s_inaOk    = false;   // 최근 읽기 성공 여부 (매 readSensors마다 갱신)
+static bool s_inaInited = false;  // 부팅 시 초기화 성공 여부 (고정)
 
 static Adafruit_BMP3XX  s_bmp;
 static Adafruit_INA219  s_ina(INA219_ADDR);
@@ -23,20 +25,44 @@ static float s_baselineTempC = 15.0f;
 
 // ── IMU 레지스터 유틸 ─────────────────────────────────────────────────────
 static bool imuWriteReg(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(IMU_ADDR);
+  Wire.beginTransmission(s_imuAddr);
   Wire.write(reg);
   Wire.write(val);
   return (Wire.endTransmission(true) == 0);
 }
 
+// 그 주소에 ACK가 오는지만 빠르게 확인 (레지스터 안 건드림)
+static bool imuPing(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return (Wire.endTransmission(true) == 0);
+}
+
 static bool imuInit() {
+  // AD0 핀 상태에 따라 0x68 또는 0x69로 응답할 수 있어 둘 다 시도
+  // (배선 작업 중 AD0 연결이 바뀌면 주소가 튈 수 있음 — 2026-07-31 추가)
+  const uint8_t altAddr = (IMU_ADDR == 0x68) ? 0x69 : 0x68;
+  if (imuPing(IMU_ADDR)) {
+    s_imuAddr = IMU_ADDR;
+  } else if (imuPing(altAddr)) {
+    s_imuAddr = altAddr;
+    Serial.print("[IMU] 0x"); Serial.print(IMU_ADDR, HEX);
+    Serial.print(" 무응답 — 0x"); Serial.print(altAddr, HEX);
+    Serial.println("에서 발견됨 (AD0 핀 배선 확인 권장, Config.h는 안 고쳐도 동작함)");
+  } else {
+    Serial.print("[IMU] 0x"); Serial.print(IMU_ADDR, HEX);
+    Serial.print("·0x"); Serial.print(altAddr, HEX);
+    Serial.println(" 둘 다 무응답 — 배선/전원 확인 필요");
+    return false;
+  }
+
   // 정체 기록 (판정 안 함)
-  Wire.beginTransmission(IMU_ADDR);
+  Wire.beginTransmission(s_imuAddr);
   Wire.write(0x75);                       // WHO_AM_I
   if (Wire.endTransmission(false) != 0) return false;   // ACK 없음 = 미연결
-  Wire.requestFrom(IMU_ADDR, 1, true);
+  Wire.requestFrom(s_imuAddr, 1, true);
   uint8_t whoami = Wire.available() ? Wire.read() : 0xFF;
-  Serial.print("[IMU] WHO_AM_I=0x"); Serial.print(whoami, HEX);
+  Serial.print("[IMU] 주소 0x"); Serial.print(s_imuAddr, HEX);
+  Serial.print(" WHO_AM_I=0x"); Serial.print(whoami, HEX);
   Serial.println(" (기록용 — 어떤 값이든 계속 진행)");
 
   if (!imuWriteReg(0x6B, 0x80)) return false;   // 전체 리셋
@@ -52,10 +78,10 @@ static bool imuInit() {
 
 // acc[mg], gyro[0.1dps]로 변환해서 반환. 실패 시 false
 static bool imuRead(int16_t acc[3], int16_t gyro[3]) {
-  Wire.beginTransmission(IMU_ADDR);
+  Wire.beginTransmission(s_imuAddr);
   Wire.write(0x3B);
   if (Wire.endTransmission(false) != 0) return false;
-  Wire.requestFrom(IMU_ADDR, 14, true);
+  Wire.requestFrom(s_imuAddr, 14, true);
   if (Wire.available() != 14) return false;
 
   int16_t raw[7];
@@ -101,6 +127,7 @@ void initSensors() {
   }
 
   s_inaOk = s_ina.begin();
+  s_inaInited = s_inaOk;   // 초기화 성공 여부는 고정 기록 (읽기 재시도 가능 여부 판단용)
   Serial.println(s_inaOk ? "[OK] INA219" : "[ERR] INA219 초기화 실패");
 }
 
@@ -138,6 +165,9 @@ void readSensors(DataPacket &p) {
   int16_t acc[3], gyro[3];
   if (imuRead(acc, gyro)) {
     for (int i = 0; i < 3; i++) { p.acc[i] = acc[i]; p.gyro[i] = gyro[i]; }
+    // 발사축 부호 보정 — 텔레메트리 값 자체를 "+ = 로켓 상승 방향"으로 통일
+    // (2026-07-31 실측: 이 장착 방향에서 원시 X축은 위로 갈수록 더 음수가 됨)
+    p.acc[LAUNCH_AXIS] *= LAUNCH_SIGN;
     s_imuOk = true;
   } else {
     s_imuOk = false;
@@ -156,14 +186,25 @@ void readSensors(DataPacket &p) {
   }
   s_bmpOk = bmpRead;   // 이번 읽기의 실제 성공 여부로 갱신 (상태점이 항상 최신 반영)
 
-  // INA — 미장착 시 -1
-  if (s_inaOk) {
-    p.voltage_mv = (int16_t)(s_ina.getBusVoltage_V() * 1000.0f);
-    p.current_ma = (int16_t)(s_ina.getCurrent_mA());
-  } else {
+  // INA — 매 읽기마다 I2C 응답 + 값 타당성 재확인 (한번 붙으면 영원히 정상 고정되던 문제 수정)
+  bool inaRead = false;
+  if (s_inaInited) {
+    Wire.beginTransmission(INA219_ADDR);
+    if (Wire.endTransmission() == 0) {
+      float v = s_ina.getBusVoltage_V();
+      float i = s_ina.getCurrent_mA();
+      if (isfinite(v) && isfinite(i) && v > 0.0f && v < 20.0f) {
+        p.voltage_mv = (int16_t)(v * 1000.0f);
+        p.current_ma = (int16_t)i;
+        inaRead = true;
+      }
+    }
+  }
+  if (!inaRead) {
     p.voltage_mv = -1;
     p.current_ma = -1;
   }
+  s_inaOk = inaRead;   // 이번 읽기의 실제 성공 여부로 갱신 (상태점이 항상 최신 반영)
 
   p.ms = millis();
 }

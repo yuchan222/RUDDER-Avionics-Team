@@ -202,8 +202,8 @@ static void checkLaunch(uint32_t now) {
   bool bmpOk = (g_pkt.altitude_cm != ALT_INVALID) && g_baselineOk;   // 기준압 자체가 불량이면 고도 경로 안 씀
 
   // 경로 A: 세로축(LAUNCH_AXIS) 가속도 2g 이상 0.3초 연속
-  int16_t launchAcc = g_pkt.acc[LAUNCH_AXIS] * LAUNCH_SIGN;
-  if (imuOk && launchAcc >= LAUNCH_ZACC_MG) {
+  // 부호 보정은 Sensors.cpp readSensors()에서 이미 적용됨 — g_pkt.acc는 항상 "+ = 상승"
+  if (imuOk && g_pkt.acc[LAUNCH_AXIS] >= LAUNCH_ZACC_MG) {
     if (!g_zaccActive) { g_zaccActive = true; g_zaccStartMs = now; }
     if (now - g_zaccStartMs >= LAUNCH_ZACC_MS) { enterFlight(now, "가속도 2g/0.3s"); return; }
   } else {
@@ -319,7 +319,8 @@ void loop() {
 
     g_pkt.flight_mode   = g_mode;
     g_pkt.eject_state   = g_ejected ? 1 : 0;
-    g_pkt.system_status = sensorStatus() | (g_sdOk ? STATUS_SD : 0)
+    // SD 상태는 isLogReady()로 매번 실제 확인 (쓰기 실패 시 그 즉시 반영됨 — 초기화 성공에 영구 고정 안 됨)
+    g_pkt.system_status = sensorStatus() | (isLogReady() ? STATUS_SD : 0)
                          | (g_baselineOk ? 0 : STATUS_BASELINE_BAD)
                          | (g_logClosed ? STATUS_LOG_CLOSED : 0);
     g_pkt.cmd_rx_count  = g_cmdRxCount;
@@ -327,7 +328,7 @@ void loop() {
     // 준비~낙하 구간만 SD 기록 (발사 전 데이터부터 착륙까지)
     if (g_mode >= MODE_ARMED && g_mode <= MODE_DESCENT) {
       finalizePacket(g_pkt);
-      writePacket(g_pkt);
+      writePacket(g_pkt);   // 실패하면 isLogReady()가 다음 주기부터 false로 반영됨
     }
   }
 
