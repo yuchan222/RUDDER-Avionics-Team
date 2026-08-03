@@ -29,7 +29,8 @@
 
 // ── 서보 각도 ─────────────────────────────────────────────────────────────
 #define SERVO_CLOSED_DEG    0
-#define SERVO_EJECT_DEG    30   // 구조상 30도 초과 회전 불가 확인됨 (2026-07-27)
+#define SERVO_EJECT_DEG    40   // 2026-08-02 실제 테스트발사엔 50도로 비행함 (기존 "30도 초과 불가"
+                                 // 메모는 부정확했던 것으로 확인) — 40도로 재조정
 #define SERVO_RECMD_MS   1000   // 사출 후 목표각 재명령 주기 (회전 실패 대비 반복)
 #define SERVO_RECMD_COUNT   5   // 재명령 최대 횟수 (무기한 반복 방지, 약 5초)
 #define SERVO_CLOSE_HOLD_MS 2000  // 착륙 시 닫힘 위치로 복귀시키는 데 전원 유지하는 시간
@@ -86,5 +87,21 @@
 #define STATUS_INA   0x08
 #define STATUS_BASELINE_BAD  0x10   // 기준압 수집 45/50 미달 (고도 신뢰 불가)
 #define STATUS_LOG_CLOSED    0x20   // SD 로그 정상 종료됨 (착륙 후)
+// 발사 감지 경로 기록용 (사후분석 — 어느 경로로 감지됐는지 텔레메트리에 남김)
+// 수동 강제진입(FORCE_FLIGHT)이면 둘 다 0
+#define STATUS_LAUNCH_ACCEL  0x40   // 가속도 경로로 발사 감지됨
+#define STATUS_LAUNCH_ALT    0x80   // 고도 경로로 발사 감지됨
+
+// ── 사출 사유 코드 (Packet.eject_state 재활용 — 0=미사출) ────────────────
+#define EJECT_REASON_NONE     0
+#define EJECT_REASON_PRIMARY  1   // 주 사출 (정점통과)
+#define EJECT_REASON_BACKUP   2   // 보조 사출 (10초 타이머)
+#define EJECT_REASON_MANUAL   3   // 지상국 비상 명령
+
+// ── IMU 값 고착(0,0,0) 자동복구 ────────────────────────────────────────────
+// 2026-08-02 실비행에서 확인: I2C ACK는 계속 성공하지만 실제 값이 0으로
+// 고착되는 증상 발견 (전례상 전원 재인가로 복구된 적 있음 — 소프트 재초기화로
+// 충분한지는 미확인이나, 최소한의 자동복구 시도로 추가)
+#define IMU_ZERO_RESET_COUNT  25   // 가속도·자이로 전부 0인 샘플이 연속 이 횟수(0.5초) 지속되면 재초기화 시도
 
 #endif

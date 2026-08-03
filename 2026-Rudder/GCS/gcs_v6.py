@@ -10,6 +10,11 @@ gcs_v5.py에서 검증된 구조를 유지하면서 2026-07-30 GPT 기술검토(
   4. 그래프 발사 기준선 1000mg→2000mg (실제 임계값과 일치)
   5. cmd_rx_count 도움말 문구 정정 (거부된 명령도 포함됨을 명시)
 
+2026-08-02 테스트 발사 피드백 반영 (패킷 47B→48B, version2~5와 바이트 호환 깨짐):
+  6. eject_state를 사출 사유코드로 확장 (0=없음/1=주사출/2=보조사출/3=비상명령) — 표시에 반영
+  7. system_status 여유비트로 발사 감지 경로(가속도/고도/수동) 기록 — 타임라인에 표시
+  8. last_cmd 필드 추가 (최근 수신 명령 바이트, 사후분석용 — SD 로그에만 기록)
+
 실행:  python -m streamlit run gcs_v6.py
 """
 
@@ -31,6 +36,10 @@ MODE_COLORS  = {0: "#555", 1: "#e67e22", 2: "#2980b9", 3: "#27ae60", 4: "#8e44ad
 STATUS_BMP, STATUS_IMU, STATUS_SD, STATUS_INA = 0x01, 0x02, 0x04, 0x08
 STATUS_BASELINE_BAD = 0x10
 STATUS_LOG_CLOSED = 0x20
+STATUS_LAUNCH_ACCEL = 0x40   # 발사 감지 경로 — 가속도
+STATUS_LAUNCH_ALT   = 0x80   # 발사 감지 경로 — 고도 (둘 다 0이면 수동 강제진입)
+
+EJECT_REASON = {0: None, 1: "주 사출 (정점통과)", 2: "보조 사출 (10초 타이머)", 3: "지상국 비상 명령"}
 
 ALT_INVALID = -2147483648   # Config.h의 ALT_INVALID(INT32_MIN)와 동일 — BMP 실패 표시
 
@@ -62,10 +71,10 @@ def cmd_packet(cmd: int) -> bytes:
     return body + bytes([_crc8(body)])
 
 
-# ─── 텔레메트리 패킷 (47B, version2와 동일 배치 · pkt_no→cmd_rx_count) ──────
-PKT_FMT    = '<HBHBHIhhhhhhihihhBBBHHH'
-PKT_SIZE   = struct.calcsize(PKT_FMT)       # 47
-CRC_OFFSET = 43
+# ─── 텔레메트리 패킷 (48B, 2026-08-02: last_cmd 1바이트 추가로 47B→48B) ─────
+PKT_FMT    = '<HBHBHIhhhhhhihihhBBBHBHH'
+PKT_SIZE   = struct.calcsize(PKT_FMT)       # 48
+CRC_OFFSET = 44
 
 
 def _crc16(data: bytes) -> int:
@@ -92,6 +101,7 @@ class Pkt:
     eject_state: int = 0
     system_status: int = 0
     cmd_rx_count: int = 0
+    last_cmd: int = 0
     rx_time: float = 0.0
 
 
@@ -101,7 +111,7 @@ def parse_raw(raw: bytes):
         v = struct.unpack_from(PKT_FMT, raw)
         if v[0] != 0xAA55 or v[-1] != 0x55AA:
             return None, True
-        if _crc16(raw[:CRC_OFFSET]) != v[21]:
+        if _crc16(raw[:CRC_OFFSET]) != v[22]:
             return None, False          # 도착했지만 손상됨
         return Pkt(
             seq=v[2], ms=v[5],
@@ -109,7 +119,7 @@ def parse_raw(raw: bytes):
             pressure=v[12], bmp_temp=v[13], altitude_cm=v[14],
             voltage_mv=v[15], current_ma=v[16],
             flight_mode=v[17], eject_state=v[18], system_status=v[19],
-            cmd_rx_count=v[20], rx_time=time.time(),
+            cmd_rx_count=v[20], last_cmd=v[21], rx_time=time.time(),
         ), True
     except Exception:
         return None, True
@@ -191,7 +201,7 @@ LOG_DIR = pathlib.Path(__file__).parent / 'logs'
 LOG_FIELDS = ['rx_time', 'seq', 'ms', 'flight_mode', 'eject_state', 'altitude_cm',
               'acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z',
               'pressure', 'bmp_temp', 'voltage_mv', 'current_ma',
-              'system_status', 'cmd_rx_count']
+              'system_status', 'cmd_rx_count', 'last_cmd']
 
 
 def open_log():
@@ -217,6 +227,7 @@ def write_log(pkt: Pkt):
         'pressure': pkt.pressure, 'bmp_temp': pkt.bmp_temp,
         'voltage_mv': pkt.voltage_mv, 'current_ma': pkt.current_ma,
         'system_status': hex(pkt.system_status), 'cmd_rx_count': pkt.cmd_rx_count,
+        'last_cmd': hex(pkt.last_cmd),
     })
     if f:
         f.flush()
@@ -239,7 +250,7 @@ def _init():
     st.session_state.t_hist = []
     st.session_state.alt_hist = []
     st.session_state.acc_hist = []
-    st.session_state.timeline = {'launch': None, 'eject': None, 'land': None}
+    st.session_state.timeline = {'launch': None, 'launch_reason': None, 'eject': None, 'land': None}
     st.session_state.prev_mode = -1
     # 비상사출 재전송 엔진
     st.session_state.eject_phase = 0          # 0=대기 1=확인대기 2=재전송중
@@ -264,7 +275,7 @@ def _reset_flight_data():
     st.session_state.t_hist = []
     st.session_state.alt_hist = []
     st.session_state.acc_hist = []
-    st.session_state.timeline = {'launch': None, 'eject': None, 'land': None}
+    st.session_state.timeline = {'launch': None, 'launch_reason': None, 'eject': None, 'land': None}
     st.session_state.prev_mode = -1
     # 비상사출/강제비행 확인 상태도 재연결 시 반드시 초기화
     # (이전 세션의 재전송이 남아있으면, 새로 연결되는 즉시 밀린 명령이 나갈 수 있음)
@@ -339,6 +350,12 @@ def _panel():
             tl, pm = st.session_state.timeline, st.session_state.prev_mode
             if pkt.flight_mode == 2 and pm in (0, 1, -1) and tl['launch'] is None:
                 tl['launch'] = pkt.rx_time
+                if pkt.system_status & STATUS_LAUNCH_ACCEL:
+                    tl['launch_reason'] = "가속도 경로"
+                elif pkt.system_status & STATUS_LAUNCH_ALT:
+                    tl['launch_reason'] = "고도 경로"
+                else:
+                    tl['launch_reason'] = "수동 강제진입"
             if pkt.flight_mode == 3 and pm != 3 and tl['eject'] is None:
                 tl['eject'] = pkt.rx_time
             if pkt.flight_mode == 4 and pm != 4 and tl['land'] is None:
@@ -380,7 +397,8 @@ def _panel():
                 unsafe_allow_html=True)
             st.caption("MOSFET 신호(명령) 기준 — 실제 전류 실측 아님")
             if last.eject_state:
-                st.error("🪂 사출 명령 실행됨 (펌웨어 기준 — 실제 낙하산 전개 확인 아님)")
+                reason = EJECT_REASON.get(last.eject_state, f"알 수 없음({last.eject_state})")
+                st.error(f"🪂 사출 명령 실행됨 — {reason} (펌웨어 기준, 실제 낙하산 전개 확인 아님)")
 
     with c_num:
         m1, m2, m3, m4 = st.columns(4)
@@ -469,7 +487,7 @@ def _panel():
             if cc2.button("취소", use_container_width=True):
                 st.session_state.eject_phase = 0
     else:  # phase 2: 자동 재전송 중
-        confirmed = (last.eject_state == 1) if last else False
+        confirmed = (last.eject_state != 0) if last else False
         timed_out = (now - st.session_state.get('retry_start_t', now)) > MAX_RETRY_S
 
         if confirmed:
@@ -500,7 +518,10 @@ def _timeline():
     def fmt(t):
         return datetime.fromtimestamp(t).strftime('%H:%M:%S') if t else '—'
     c1, c2, c3 = st.columns(3)
-    c1.metric("🚀 발사(비행 진입)", fmt(tl['launch']))
+    launch_label = "🚀 발사(비행 진입)"
+    if tl.get('launch_reason'):
+        launch_label += f" · {tl['launch_reason']}"
+    c1.metric(launch_label, fmt(tl['launch']))
     c2.metric("🪂 사출(낙하 진입)", fmt(tl['eject']))
     c3.metric("🛬 착륙", fmt(tl['land']))
 

@@ -11,6 +11,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 static bool s_imuOk    = false;
+static uint16_t s_imuZeroCount = 0;   // 가속도·자이로 전부 0 연속 카운트 (고착 감지용)
 static uint8_t s_imuAddr = IMU_ADDR;   // 실제 응답하는 주소로 부팅 시 자동 확정됨 (AD0 핀 상태에 따라 0x68/0x69)
 static bool s_bmpOk    = false;   // 최근 읽기 성공 여부 (매 readSensors마다 갱신 — 상태점 최신성 유지)
 static bool s_bmpInited = false;  // 부팅 시 초기화 성공 여부 (고정, 읽기 재시도 가능 여부 판단용)
@@ -169,6 +170,20 @@ void readSensors(DataPacket &p) {
     // (2026-07-31 실측: 이 장착 방향에서 원시 X축은 위로 갈수록 더 음수가 됨)
     p.acc[LAUNCH_AXIS] *= LAUNCH_SIGN;
     s_imuOk = true;
+
+    // I2C ACK는 정상인데 값만 0,0,0으로 고착되는 증상 감지 (2026-08-02 실비행 확인)
+    // — 정지 상태에서도 중력 성분 때문에 가속도 3축이 동시에 정확히 0일 수는 없음
+    bool allZero = (acc[0] == 0 && acc[1] == 0 && acc[2] == 0
+                 && gyro[0] == 0 && gyro[1] == 0 && gyro[2] == 0);
+    if (allZero) {
+      if (++s_imuZeroCount >= IMU_ZERO_RESET_COUNT) {
+        Serial.println("[IMU] 0,0,0 고착 감지 — 재초기화 시도");
+        imuInit();
+        s_imuZeroCount = 0;
+      }
+    } else {
+      s_imuZeroCount = 0;
+    }
   } else {
     s_imuOk = false;
   }

@@ -55,8 +55,11 @@ static Servo      g_servo;
 static DataPacket g_pkt;
 static uint8_t    g_mode        = MODE_SAFE;
 static bool       g_ejected     = false;
+static uint8_t    g_ejectReason = EJECT_REASON_NONE;   // 사출 사유 (패킷으로 보고)
+static uint8_t    g_launchReasonBits = 0;               // STATUS_LAUNCH_ACCEL/ALT (패킷으로 보고)
 static uint32_t   g_launchMs    = 0;      // 발사 감지 시각
 static uint16_t   g_cmdRxCount  = 0;      // 유효 명령 누적 수신 (패킷으로 보고)
+static uint8_t    g_lastCmd     = 0;      // 가장 최근 수신한 명령 바이트 (패킷으로 보고)
 static bool       g_sdOk        = false;
 static bool       g_baselineOk  = false;  // 마지막 ARMED 진입 시 기준압 수집 성공 여부 (아직 수집 전엔 false가 맞음)
 static uint8_t    g_servoRecmdLeft = 0;   // 사출 후 남은 재명령 횟수 (무기한 반복 방지)
@@ -79,12 +82,13 @@ static bool       g_servoOffDone = false; // 착륙 후 전원차단 완료 여�
 // ═══════════════════════════════════════════════════════════════════════════
 //  사출 (한 곳에서만 실행 — 어디서 호출되든 동일 동작)
 // ═══════════════════════════════════════════════════════════════════════════
-static void doEject(const char *reason) {
+static void doEject(uint8_t reasonCode, const char *reasonStr) {
   if (!g_ejected) {
     g_ejected = true;
+    g_ejectReason = reasonCode;
     g_servo.write(SERVO_EJECT_DEG);
     g_servoRecmdLeft = SERVO_RECMD_COUNT;
-    Serial.print("[EJECT] "); Serial.println(reason);
+    Serial.print("[EJECT] "); Serial.println(reasonStr);
   }
   g_mode = MODE_DESCENT;
 }
@@ -107,6 +111,7 @@ static void enterArmed() {
   g_peakAltM    = 0.0f;
   g_dropCount   = 0;
   g_peakConfirmCount = 0;
+  g_launchReasonBits = 0;
   g_mode = MODE_ARMED;
   Serial.println("[MODE] 1 준비 (발사감지 대기)");
 }
@@ -140,6 +145,7 @@ static uint8_t crc8(const uint8_t *d, uint8_t n) {
 
 static void handleCommand(uint8_t cmd, uint32_t now) {
   g_cmdRxCount++;   // 유효 명령이면 종류 무관 카운트 (GCS 재전송 확인용)
+  g_lastCmd = cmd;  // 사후분석용 — 거부된 명령이라도 어떤 시도였는지는 남김
 
   switch (cmd) {
     case CMD_SET_STANDBY:
@@ -161,7 +167,7 @@ static void handleCommand(uint8_t cmd, uint32_t now) {
         Serial.println("[거부] 비상사출 — 대기·착륙 상태에서는 무시");
         break;
       }
-      doEject("지상국 비상 명령");   // 준비·비행·낙하 중엔 그대로 무조건 실행
+      doEject(EJECT_REASON_MANUAL, "지상국 비상 명령");   // 준비·비행·낙하 중엔 그대로 무조건 실행
       break;
     case CMD_FORCE_LAND:
       if (g_mode != MODE_DESCENT) { Serial.println("[거부] 착륙 강제전환 — 낙하 상태에서만 가능"); break; }
@@ -205,14 +211,22 @@ static void checkLaunch(uint32_t now) {
   // 부호 보정은 Sensors.cpp readSensors()에서 이미 적용됨 — g_pkt.acc는 항상 "+ = 상승"
   if (imuOk && g_pkt.acc[LAUNCH_AXIS] >= LAUNCH_ZACC_MG) {
     if (!g_zaccActive) { g_zaccActive = true; g_zaccStartMs = now; }
-    if (now - g_zaccStartMs >= LAUNCH_ZACC_MS) { enterFlight(now, "가속도 2g/0.3s"); return; }
+    if (now - g_zaccStartMs >= LAUNCH_ZACC_MS) {
+      g_launchReasonBits = STATUS_LAUNCH_ACCEL;
+      enterFlight(now, "가속도 2g/0.3s");
+      return;
+    }
   } else {
     g_zaccActive = false;
   }
 
   // 경로 B: 고도 10m 이상 5회 연속
   if (bmpOk && g_pkt.altitude_cm >= (int32_t)(LAUNCH_ALT_M * 100)) {
-    if (++g_altHitCount >= LAUNCH_ALT_COUNT) { enterFlight(now, "고도 10m"); return; }
+    if (++g_altHitCount >= LAUNCH_ALT_COUNT) {
+      g_launchReasonBits = STATUS_LAUNCH_ALT;
+      enterFlight(now, "고도 10m");
+      return;
+    }
   } else {
     g_altHitCount = 0;
   }
@@ -226,7 +240,7 @@ static void checkEjection(uint32_t now) {
 
   // 보조 사출: 발사 10초 후 묻지도 따지지도 않고 (센서·잠금 무관)
   if (sinceLaunch >= BACKUP_TIMER_MS) {
-    doEject("보조 사출 (10초 타이머)");
+    doEject(EJECT_REASON_BACKUP, "보조 사출 (10초 타이머)");
     return;
   }
 
@@ -257,7 +271,7 @@ static void checkEjection(uint32_t now) {
   if (bmpOk && g_peakAltM >= MIN_APOGEE_ALT_M
             && (g_peakAltM - altM) >= APOGEE_DROP_M) {
     if (++g_dropCount >= APOGEE_DROP_COUNT)
-      doEject("주 사출 (정점 통과)");
+      doEject(EJECT_REASON_PRIMARY, "주 사출 (정점 통과)");
   } else if (bmpOk) {
     g_dropCount = 0;
   }
@@ -318,12 +332,14 @@ void loop() {
     }
 
     g_pkt.flight_mode   = g_mode;
-    g_pkt.eject_state   = g_ejected ? 1 : 0;
+    g_pkt.eject_state   = g_ejectReason;
     // SD 상태는 isLogReady()로 매번 실제 확인 (쓰기 실패 시 그 즉시 반영됨 — 초기화 성공에 영구 고정 안 됨)
     g_pkt.system_status = sensorStatus() | (isLogReady() ? STATUS_SD : 0)
                          | (g_baselineOk ? 0 : STATUS_BASELINE_BAD)
-                         | (g_logClosed ? STATUS_LOG_CLOSED : 0);
+                         | (g_logClosed ? STATUS_LOG_CLOSED : 0)
+                         | g_launchReasonBits;
     g_pkt.cmd_rx_count  = g_cmdRxCount;
+    g_pkt.last_cmd      = g_lastCmd;
 
     // 준비~낙하 구간만 SD 기록 (발사 전 데이터부터 착륙까지)
     if (g_mode >= MODE_ARMED && g_mode <= MODE_DESCENT) {
