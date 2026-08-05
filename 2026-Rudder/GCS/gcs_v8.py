@@ -445,14 +445,15 @@ class Sparkline(tk.Canvas):
 
 
 class AttitudeIndicator(tk.Canvas):
-    """로켓 자세 — 버블레벨 스타일. 실제 상보필터 결과(tilt_xy/tilt_xz)를 표시.
-    version8 펌웨어 실험 기능 — 자세추정 자체가 완성되기 전까지는 참고용."""
-    MAX_DEG = 30.0   # 이 각도에서 원 테두리에 닿음 (그 이상은 테두리에 클램프)
+    """로켓 자세 — 2D 로켓 실루엣이 실제 tilt_xy/tilt_xz 값에 따라 기울어짐.
+    (실제 Fusion360 OBJ 3D 모델은 Three.js/WebGL이 필요해서 Tkinter엔 못 넣음 —
+    v7의 브라우저 기반 3D뷰와는 별개. 여기선 2D 실루엣 회전으로 근사함.)
+    version8 실험 기능 — 자세추정 자체가 완성되기 전까지는 참고용."""
 
     def __init__(self, parent, **kw):
         super().__init__(parent, bg=SURFACE2, bd=0, highlightthickness=0, **kw)
-        self._xy = 0.0
-        self._xz = 0.0
+        self._xy = 0.0   # roll처럼 사용 (2D 평면 내 회전)
+        self._xz = 0.0   # pitch처럼 사용 (수직 축소로 앞뒤 기울임 표현)
 
     def update_tilt(self, tilt_xy, tilt_xz):
         self._xy = tilt_xy
@@ -464,27 +465,51 @@ class AttitudeIndicator(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 10 or h < 10:
             return
-        cx, cy = w / 2, h / 2
-        r = min(w, h) / 2 - 10
 
-        # 외곽 원 + 기준 십자선
-        self.create_oval(cx - r, cy - r, cx + r, cy + r, outline=BORDER2, width=1)
-        self.create_oval(cx - r * 0.5, cy - r * 0.5, cx + r * 0.5, cy + r * 0.5,
-                          outline=BORDER, width=1, dash=(2, 3))
-        self.create_line(cx - r, cy, cx + r, cy, fill=BORDER, dash=(2, 3))
-        self.create_line(cx, cy - r, cx, cy + r, fill=BORDER, dash=(2, 3))
-        self.create_text(cx, cy - r - 8, text="X-Z", font=("Arial", 7), fill=MUTED)
-        self.create_text(cx + r + 14, cy, text="X-Y", font=("Arial", 7), fill=MUTED)
+        # 상단: 실측 각도 텍스트 (원/실루엣 밖 고정 위치라 절대 안 잘림)
+        self.create_text(w / 2, 6, text=f"XY {self._xy:+.1f}°   XZ {self._xz:+.1f}°",
+                          font=("Courier", 10, "bold"), fill=TEXT, anchor="n")
 
-        # 기울기 벡터 (원 밖으로 나가면 테두리에 클램프)
-        dx = max(-self.MAX_DEG, min(self.MAX_DEG, self._xy)) / self.MAX_DEG * r
-        dy = -max(-self.MAX_DEG, min(self.MAX_DEG, self._xz)) / self.MAX_DEG * r
-        px, py = cx + dx, cy + dy
-        self.create_line(cx, cy, px, py, fill=AMBER, width=1)
-        self.create_oval(px - 6, py - 6, px + 6, py + 6, fill=CYAN, outline=SURFACE)
+        cx, cy = w / 2, h / 2 + 8
+        roll = math.radians(self._xy)
+        pitch = math.radians(self._xz)
+        bw, bh = min(w, h) * 0.14, min(w, h) * 0.42
 
-        self.create_text(cx, cy + r + 12, text=f"XY {self._xy:+.1f}°  XZ {self._xz:+.1f}°",
-                          font=("Courier", 9, "bold"), fill=TEXT)
+        def transform(px, py):
+            rx = px * math.cos(roll) - py * math.sin(roll)
+            ry = px * math.sin(roll) + py * math.cos(roll)
+            ry *= math.cos(pitch)   # 앞/뒤로 기울면 짧아 보이게 (원근 근사)
+            return cx + rx, cy + ry
+
+        corners = [(-bw/2, -bh/2), (bw/2, -bh/2), (bw/2, bh/2), (-bw/2, bh/2)]
+        pts = []
+        for px, py in corners:
+            pts.extend(transform(px, py))
+
+        # 기준 십자선 (정자세 참고용)
+        ref = min(w, h) * 0.42
+        self.create_line(cx - ref, cy, cx + ref, cy, fill=BORDER, dash=(2, 4))
+        self.create_line(cx, cy - ref, cx, cy + ref, fill=BORDER, dash=(2, 4))
+
+        # 그림자 + 몸통
+        self.create_polygon([x + 3 for x in pts[::2]] + [y + 3 for y in pts[1::2]],
+                             fill="#050810", outline="")
+        self.create_polygon(pts, fill=SURFACE, outline=BORDER2, width=1)
+
+        # 노즈콘
+        tip = transform(0, -bh/2 - bw * 0.7)
+        left = transform(-bw/2, -bh/2)
+        right = transform(bw/2, -bh/2)
+        self.create_polygon(tip[0], tip[1], left[0], left[1], right[0], right[1],
+                             fill=CYAN_DIM, outline=CYAN, width=1)
+
+        # 핀 (좌우)
+        for side in (-1, 1):
+            f1 = transform(side * bw/2, bh/2 - bw*0.3)
+            f2 = transform(side * (bw/2 + bw*0.8), bh/2 + bw*0.5)
+            f3 = transform(side * bw/2, bh/2)
+            self.create_polygon(f1[0], f1[1], f2[0], f2[1], f3[0], f3[1],
+                                 fill=SURFACE2, outline=BORDER2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -743,11 +768,10 @@ class RocketGCS(tk.Tk):
     def _build_right(self, parent):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=0)   # 데이터 카드
-        parent.rowconfigure(1, weight=0)   # 센서 상태
+        parent.rowconfigure(1, weight=1)   # 센서 상태 — 남는 공간 절반 흡수 (여백 없애기)
         parent.rowconfigure(2, weight=0)   # 서보 + 모드제어
-        parent.rowconfigure(3, weight=0)   # 타임라인
-        parent.rowconfigure(4, weight=1)   # 여백 흡수
-        parent.rowconfigure(5, weight=0)   # 비상사출 + 발사이벤트
+        parent.rowconfigure(3, weight=1)   # 타임라인 — 남는 공간 나머지 절반 흡수
+        parent.rowconfigure(4, weight=0)   # 비상사출 + 발사이벤트
 
         self._build_datacards(parent)
         self._build_sensor_panel(parent)
@@ -777,9 +801,9 @@ class RocketGCS(tk.Tk):
 
     def _build_sensor_panel(self, parent):
         sens_panel = self._panel(parent, "센서 상태", MUTED)
-        sens_panel.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        sens_panel.grid(row=1, column=0, sticky="nsew", pady=(0, 6))
         sens_row = tk.Frame(sens_panel, bg=SURFACE)
-        sens_row.pack(fill="x", padx=8, pady=(0, 6))
+        sens_row.pack(fill="both", expand=True, padx=8, pady=(0, 6))
         self.sensor_frames = {}
         for name in self.SENSOR_NAMES:
             f = tk.Frame(sens_row, bg=RED_DIM, bd=0, highlightthickness=1, highlightbackground=RED)
@@ -830,15 +854,16 @@ class RocketGCS(tk.Tk):
 
     def _build_timeline_panel(self, parent):
         tl_panel = self._panel(parent, "타임라인", CYAN)
-        tl_panel.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        tl_panel.grid(row=3, column=0, sticky="nsew", pady=(0, 6))
         tl_inner = tk.Frame(tl_panel, bg=SURFACE)
-        tl_inner.pack(fill="x", padx=6, pady=6)
+        tl_inner.pack(fill="both", expand=True, padx=6, pady=6)
         tl_inner.columnconfigure((0, 1, 2), weight=1, uniform="tl")
+        tl_inner.rowconfigure(0, weight=1)
         self.tl_vals = {}
         self.tl_sub = {}
         for i, (lbl, clr) in enumerate([("발사시각", CYAN), ("사출시각", AMBER), ("착륙시각", GREEN)]):
             card = tk.Frame(tl_inner, bg=SURFACE2, bd=0, highlightthickness=1, highlightbackground=BORDER)
-            card.grid(row=0, column=i, sticky="ew", padx=2)
+            card.grid(row=0, column=i, sticky="nsew", padx=2)
             tk.Label(card, text=lbl.upper(), font=("Arial", 7, "bold"), bg=SURFACE2, fg=MUTED,
                      anchor="w").pack(fill="x", padx=6, pady=(3, 0))
             v = tk.Label(card, text="--:--:--", font=("Courier", 10, "bold"), bg=SURFACE2, fg=clr, anchor="w")
@@ -866,9 +891,9 @@ class RocketGCS(tk.Tk):
 
     def _build_emer_row(self, parent):
         row = tk.Frame(parent, bg=BG)
-        row.grid(row=5, column=0, sticky="ew")
-        row.columnconfigure(0, weight=1)
-        row.columnconfigure(1, weight=1)
+        row.grid(row=4, column=0, sticky="ew")
+        row.columnconfigure(0, weight=3)   # 비상사출 — 더 넓게(안전 관련 최우선 요소)
+        row.columnconfigure(1, weight=2)   # 발사 이벤트 — 상대적으로 축소
 
         emer_panel = self._panel(row, "비상 사출", RED)
         emer_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
@@ -880,18 +905,20 @@ class RocketGCS(tk.Tk):
         tl2_panel.grid(row=0, column=1, sticky="nsew", padx=(3, 0))
         tl2_inner = tk.Frame(tl2_panel, bg=SURFACE)
         tl2_inner.pack(fill="both", expand=True, padx=10, pady=10)
-        tk.Label(tl2_inner, text="경과시간 (발사 후, 착륙 시 정지)", font=("Arial", 8, "bold"),
-                 bg=SURFACE, fg=MUTED, anchor="w").pack(fill="x")
+        tk.Label(tl2_inner, text="경과시간 (발사 후 · 착륙 시 정지)", font=("Arial", 8, "bold"),
+                 bg=SURFACE, fg=MUTED, anchor="w", wraplength=160, justify="left").pack(fill="x")
         self.uptime_lbl = tk.Label(tl2_inner, text="--:--:--", font=("Courier", 20, "bold"),
                                     fg=CYAN, bg=SURFACE)
         self.uptime_lbl.pack(pady=(4, 0), anchor="w")
 
         tk.Frame(tl2_inner, bg=BORDER, height=1).pack(fill="x", pady=12)
-        tk.Label(tl2_inner, text="명령 누적 수신 (내역은 이벤트 로그 참고)", font=("Arial", 8, "bold"),
+        tk.Label(tl2_inner, text="명령 누적 수신", font=("Arial", 8, "bold"),
                  bg=SURFACE, fg=MUTED, anchor="w").pack(fill="x")
         self.cmdrx_lbl = tk.Label(tl2_inner, text="—", font=("Courier", 22, "bold"),
                                    fg=CYAN, bg=SURFACE)
         self.cmdrx_lbl.pack(pady=(4, 0), anchor="w")
+        tk.Label(tl2_inner, text="(상세 내역은 이벤트 로그 참고)", font=("Arial", 7),
+                 bg=SURFACE, fg=MUTED, anchor="w", wraplength=160, justify="left").pack(fill="x")
 
     # ── 비상 사출 UI (2단계 확인 + 자동 재전송, gcs_v6.py 로직 그대로) ──────
     def _build_emer_idle(self):
@@ -901,10 +928,10 @@ class RocketGCS(tk.Tk):
             self.emer_inner, text="⚠  비상 사출", font=("Courier", 16, "bold"), bg="#7a0000",
             fg="white", activebackground="#9a0000", activeforeground="white", bd=0,
             highlightthickness=2, highlightbackground=RED, cursor="hand2", pady=18,
-            wraplength=220, state="disabled", command=self._emer_click)
+            wraplength=260, state="disabled", command=self._emer_click)
         self.emer_btn.pack(fill="x", pady=(0, 10))
         self.emer_status = tk.Label(self.emer_inner, text="", font=("Courier", 12, "bold"),
-                                     bg=SURFACE, fg=RED, wraplength=220, justify="center")
+                                     bg=SURFACE, fg=RED, wraplength=260, justify="center")
         self.emer_status.pack(fill="x")
 
     def _emer_click(self):
@@ -950,7 +977,7 @@ class RocketGCS(tk.Tk):
             w.destroy()
         self.emer_progress_lbl = tk.Label(self.emer_inner, text="📡 자동 재전송 중...",
                                            font=("Courier", 10, "bold"), bg=SURFACE, fg=AMBER,
-                                           wraplength=190, justify="center")
+                                           wraplength=260, justify="center")
         self.emer_progress_lbl.pack(pady=(10, 6))
         tk.Button(self.emer_inner, text="🛑 재전송 중단", font=("Arial", 9, "bold"), bg=SURFACE2,
                   fg=MUTED, bd=0, highlightthickness=1, highlightbackground=BORDER2, padx=10,
@@ -972,10 +999,10 @@ class RocketGCS(tk.Tk):
         else:
             detail = f"전송 {self.retry_sent}회 만에 확인 — {reason}" if reason else f"전송 {self.retry_sent}회 만에 확인"
         tk.Label(self.emer_inner, text=f"✅ 로켓 확인됨\n({detail})",
-                 font=("Courier", 10, "bold"), bg=SURFACE, fg=GREEN, wraplength=190,
+                 font=("Courier", 10, "bold"), bg=SURFACE, fg=GREEN, wraplength=260,
                  justify="center").pack(pady=(14, 4))
         tk.Label(self.emer_inner, text="펌웨어 기준 — 실제 낙하산 전개 확인 아님", font=("Arial", 7),
-                 bg=SURFACE, fg=MUTED, wraplength=190, justify="center").pack(pady=(0, 8))
+                 bg=SURFACE, fg=MUTED, wraplength=260, justify="center").pack(pady=(0, 8))
         tk.Button(self.emer_inner, text="확인 (닫기)", font=("Arial", 9, "bold"), bg=SURFACE2,
                   fg=MUTED, bd=0, highlightthickness=1, highlightbackground=BORDER2, padx=10,
                   pady=6, cursor="hand2", command=self._build_emer_idle).pack(fill="x")
@@ -985,7 +1012,7 @@ class RocketGCS(tk.Tk):
         for w in self.emer_inner.winfo_children():
             w.destroy()
         tk.Label(self.emer_inner, text=f"⏱️ {MAX_RETRY_S:.0f}초 동안\n확인 안 됨 — 중단",
-                 font=("Courier", 9, "bold"), bg=SURFACE, fg=RED, wraplength=190,
+                 font=("Courier", 9, "bold"), bg=SURFACE, fg=RED, wraplength=260,
                  justify="center").pack(pady=(14, 8))
         tk.Button(self.emer_inner, text="확인 (닫기)", font=("Arial", 9, "bold"), bg=SURFACE2,
                   fg=MUTED, bd=0, highlightthickness=1, highlightbackground=BORDER2, padx=10,
