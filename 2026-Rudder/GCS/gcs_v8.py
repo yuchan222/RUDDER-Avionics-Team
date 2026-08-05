@@ -491,9 +491,9 @@ class AttitudeIndicator(tk.Canvas):
         self.create_line(cx - ref, cy, cx + ref, cy, fill=BORDER, dash=(2, 4))
         self.create_line(cx, cy - ref, cx, cy + ref, fill=BORDER, dash=(2, 4))
 
-        # 그림자 + 몸통
-        self.create_polygon([x + 3 for x in pts[::2]] + [y + 3 for y in pts[1::2]],
-                             fill="#050810", outline="")
+        # 그림자 + 몸통 (x,y 각각 +3만큼 오프셋 — 이전엔 x끼리/y끼리 따로 모아서
+        # create_polygon에 잘못된 좌표 순서로 들어가 이상한 삼각형이 그려지던 버그)
+        self.create_polygon([c + 3 for c in pts], fill="#050810", outline="")
         self.create_polygon(pts, fill=SURFACE, outline=BORDER2, width=1)
 
         # 노즈콘
