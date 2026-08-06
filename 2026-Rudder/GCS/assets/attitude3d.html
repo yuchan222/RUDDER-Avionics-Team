@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>로켓 자세 3D</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #0d1117; }
+  #rocket3d { width: 100vw; height: 100vh; }
+  #label {
+    position: fixed; top: 8px; right: 10px; text-align: right;
+    color: #e6edf3; font-family: 'Courier New', monospace; font-size: 13px;
+    font-weight: bold; pointer-events: none; text-shadow: 0 0 4px #000;
+    line-height: 1.4; white-space: pre;
+  }
+  #status {
+    position: fixed; bottom: 6px; left: 0; right: 0; text-align: center;
+    color: #8b949e; font-family: Arial, sans-serif; font-size: 11px; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="rocket3d"></div>
+<div id="label">XY +0.0°
+XZ +0.0°</div>
+<div id="status">모델 로딩 중...</div>
+
+<script src="three.min.js"></script>
+<script src="OBJLoader.js"></script>
+<script src="MTLLoader.js"></script>
+<script>
+(function () {
+  const el = document.getElementById('rocket3d');
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 5000);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setClearColor(0x0d1117, 1);
+  el.appendChild(renderer.domElement);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+  sun.position.set(1, 1, 1);
+  scene.add(sun);
+  const fill = new THREE.DirectionalLight(0xffffff, 0.3);
+  fill.position.set(-1, -0.5, -1);
+  scene.add(fill);
+
+  let pivot = null;
+
+  window.setTilt = function (tiltXYdeg, tiltXZdeg) {
+    document.getElementById('label').textContent =
+      `XY ${tiltXYdeg >= 0 ? '+' : ''}${tiltXYdeg.toFixed(1)}°\nXZ ${tiltXZdeg >= 0 ? '+' : ''}${tiltXZdeg.toFixed(1)}°`;
+    if (!pivot) return;
+
+    // tiltXY=atan2(accY,accX), tiltXZ=atan2(accZ,accX) 이므로 cos(a)의 부호가
+    // 항상 accX의 부호와 같음 — 이걸로 노즈 방향(X축) 단위벡터를 복원.
+    // (이전엔 nx=cos(a)*cos(b)로만 조합했는데, 두 각도가 동시에 90°를 넘는
+    //  경우 — 예: 노즈가 똑바로 아래를 향할 때 — 부호가 반대로 뒤집혀서
+    //  실제로는 노즈-다운인데 화면엔 노즈-업으로 나오는 버그가 있었음.
+    //  sgn을 곱해 accX 부호를 명시적으로 되살려서 고침.)
+    const rxy = THREE.MathUtils.degToRad(tiltXYdeg);
+    const rxz = THREE.MathUtils.degToRad(tiltXZdeg);
+    const sgn = Math.cos(rxy) < 0 ? -1 : 1;
+    const nx = sgn * Math.cos(rxy) * Math.cos(rxz);
+    const ny = sgn * Math.sin(rxy) * Math.cos(rxz);
+    const nz = sgn * Math.cos(rxy) * Math.sin(rxz);
+
+    // 센서(X,Y,Z) → Three.js 씬 좌표 매핑 (v7과 동일 관례: threeX=sensorY, threeY=sensorX, threeZ=sensorZ)
+    const target = new THREE.Vector3(ny, nx, nz).normalize();
+    const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), target);
+    pivot.quaternion.copy(q);
+    renderer.render(scene, camera);
+  };
+
+  function initScene(objText, mtlText) {
+    const materials = new THREE.MTLLoader().parse(mtlText, '');
+    materials.preload();
+    const objLoader = new THREE.OBJLoader();
+    objLoader.setMaterials(materials);
+    const rocket = objLoader.parse(objText);
+
+    const box = new THREE.Box3().setFromObject(rocket);
+    const center = box.getCenter(new THREE.Vector3());
+    const sphere = box.getBoundingSphere(new THREE.Sphere());
+    rocket.position.sub(center);
+
+    pivot = new THREE.Group();
+    pivot.add(rocket);
+    scene.add(pivot);
+
+    const gridSize = Math.max(sphere.radius * 3, 10);
+    const grid = new THREE.GridHelper(gridSize, 14, 0x30363d, 0x21262d);
+    grid.position.y = -sphere.radius;
+    scene.add(grid);
+
+    // 로켓+그리드가 화면에 꽉 차서 노즈콘 끝이 살짝 잘리길래 카메라를 살짝
+    // 뒤로 빼서(2.4 → 2.4/0.9) 전체를 0.9배로 축소해 보이는 것과 같은 효과.
+    const camDist = sphere.radius * 2.4 / 0.9;
+    const camDir = new THREE.Vector3(0.55, 0.45, 0.85).normalize();
+    camera.position.copy(camDir.multiplyScalar(camDist));
+    camera.lookAt(0, 0, 0);
+
+    renderer.render(scene, camera);
+    document.getElementById('status').textContent = '';
+  }
+
+  Promise.all([
+    fetch('rocket_shell.obj').then(r => r.text()),
+    fetch('rocket_shell.mtl').then(r => r.text()),
+  ]).then(([objText, mtlText]) => {
+    initScene(objText, mtlText);
+  }).catch(err => {
+    document.getElementById('status').textContent = '모델 로딩 실패: ' + err;
+  });
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.render(scene, camera);
+  });
+})();
+</script>
+</body>
+</html>

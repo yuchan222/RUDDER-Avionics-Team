@@ -12,11 +12,12 @@ CSV로 변환하고 비행 요약을 출력한다.
 출력:
   입력과 같은 위치에 LOG00001.csv (+ --plot 시 LOG00001.png)
 
-패킷 포맷: Packet.h __attribute__((packed)) 와 동일 (총 48 bytes)
+패킷 포맷: Packet.h __attribute__((packed)) 와 동일 (총 52 bytes, Rudder2026 펌웨어)
 CRC16   : Logger.cpp와 동일 (CCITT, init 0xFFFF, poly 0x1021, crc16 필드 직전까지)
 
 2026-08-02: version6에 last_cmd 필드 추가되며 47B→48B로 변경됨.
-version2~5(구 47B 포맷) 로그는 이 버전으로 디코딩하면 깨짐 — 필요하면 git
+2026-08-05: version8(현 Rudder2026)에 tilt_xy/tilt_xz(자세추정) 필드 추가되며 48B→52B로 변경됨.
+version_final 이하(48B 이하) 로그는 이 버전으로 디코딩하면 깨짐 — 필요하면 git
 히스토리에서 이전 버전의 스크립트를 참고할 것.
 """
 
@@ -26,9 +27,9 @@ import pathlib
 import struct
 import sys
 
-PKT_FMT   = '<HBHBHIhhhhhhihihhBBBHBHH'
-PKT_SIZE  = struct.calcsize(PKT_FMT)          # 48
-CRC_OFFSET = 44                               # offsetof(DataPacket, crc16)
+PKT_FMT   = '<HBHBHIhhhhhhihihhBBBHBhhHH'
+PKT_SIZE  = struct.calcsize(PKT_FMT)          # 52
+CRC_OFFSET = 48                               # offsetof(DataPacket, crc16)
 STX        = 0xAA55
 ETX        = 0x55AA
 STX_BYTES  = struct.pack('<H', STX)
@@ -44,7 +45,8 @@ FIELDS = [
     'acc_x_mg', 'acc_y_mg', 'acc_z_mg',
     'gyro_x_ddps', 'gyro_y_ddps', 'gyro_z_ddps',
     'pressure_pa', 'bmp_temp_c', 'altitude_m',
-    'voltage_v', 'current_ma', 'system_status', 'last_cmd', 'crc_ok',
+    'voltage_v', 'current_ma', 'system_status', 'last_cmd',
+    'tilt_xy_deg', 'tilt_xz_deg', 'crc_ok',
 ]
 
 
@@ -73,7 +75,7 @@ def decode_file(path: pathlib.Path, make_plot: bool) -> None:
             etx_bad += 1
             i += 1
             continue
-        crc_ok = crc16_ccitt(chunk[:CRC_OFFSET]) == v[22]
+        crc_ok = crc16_ccitt(chunk[:CRC_OFFSET]) == v[24]
         if not crc_ok:
             crc_bad += 1
 
@@ -86,7 +88,9 @@ def decode_file(path: pathlib.Path, make_plot: bool) -> None:
             'pressure_pa': v[12], 'bmp_temp_c': round(v[13] / 100.0, 2),
             'altitude_m': round(alt_cm / 100.0, 2) if alt_cm != ALT_INVALID else '',   # ALT_INVALID = BMP 실패
             'voltage_v': round(v[15] / 1000.0, 3), 'current_ma': v[16],
-            'system_status': f'0x{v[19]:02X}', 'last_cmd': f'0x{v[21]:02X}', 'crc_ok': int(crc_ok),
+            'system_status': f'0x{v[19]:02X}', 'last_cmd': f'0x{v[21]:02X}',
+            'tilt_xy_deg': round(v[22] / 100.0, 2), 'tilt_xz_deg': round(v[23] / 100.0, 2),
+            'crc_ok': int(crc_ok),
         })
         i += PKT_SIZE
 
@@ -123,6 +127,24 @@ def decode_file(path: pathlib.Path, make_plot: bool) -> None:
     if alts:
         print(f'  최고 고도: {max(alts):.2f} m   /  BMP 실패 샘플: {len(rows) - len(alts)}개')
     print(f'  최대 Z가속도: {max(accz)} mg  /  최소: {min(accz)} mg')
+
+    # ── 전압 스파이크/드롭 탐지 ──────────────────────────────
+    volts = [(r['t_sec'], r['voltage_v']) for r in rows if r['voltage_v'] > 0]
+    if volts:
+        vmin = min(v for _, v in volts)
+        vmax = max(v for _, v in volts)
+        print(f'  전압 범위: {vmin:.3f}V ~ {vmax:.3f}V')
+        jumps = []
+        for (ta, va), (tb, vb) in zip(volts, volts[1:]):
+            if abs(vb - va) >= 0.5:   # 샘플 간 0.5V 이상 급변 — 스파이크/드롭 의심
+                jumps.append((ta, tb, va, vb))
+        if jumps:
+            print(f'  [!] 전압 급변 {len(jumps)}건 (샘플 간 0.5V 이상):')
+            for ta, tb, va, vb in jumps:
+                arrow = '급상승' if vb > va else '급하락'
+                print(f'      {ta:.2f}s→{tb:.2f}s   {va:.3f}V → {vb:.3f}V  ({arrow})')
+        else:
+            print('  전압 급변(0.5V 이상 순간 변화) 없음')
     print(f'  모드 전환: ' + '  ->  '.join(
         f'{FLIGHT_MODES.get(m, m)}@{t:.1f}s' for m, t in modes_seen))
     if eject_row is not None:
