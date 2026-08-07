@@ -94,6 +94,17 @@ MAX_RETRY_S   = 30.0
 HISTORY_MAX   = 700
 SERVO_CLOSE_HOLD_MS = 2000   # 펌웨어 Config.h와 동일 — 착륙 후 이 시간만큼은 서보 전원 유지
 
+# 모드전환 명령 자동 재전송 — 링크가 나빠 한 번 보낸 명령이 씹혀도 사람이
+# 다시 누를 필요 없이 GCS가 알아서 몇 초간 재전송 (비상사출 재전송 엔진과 같은 취지)
+MODE_CMD_RETRY_GAP_S = 0.5
+MODE_CMD_RETRY_MAX_S = 8.0
+TARGET_MODE_AFTER = {
+    CMD_SET_STANDBY:  0,
+    CMD_SET_ARMED:    1,
+    CMD_FORCE_FLIGHT: 2,
+    CMD_FORCE_LAND:   4,
+}
+
 PKT_FMT    = '<HBHBHIhhhhhhihihhBBBHBhhHH'   # 52바이트 — Rudder2026 전용 (tilt_xy/tilt_xz 추가)
 PKT_SIZE   = struct.calcsize(PKT_FMT)
 CRC_OFFSET = 48
@@ -511,6 +522,11 @@ class RocketGCS(tk.Tk):
         self.retry_start_t = 0.0
         self.last_retry_t = 0.0
 
+        self.pending_mode_cmd = None      # 재전송 중인 모드전환 명령 (완료/타임아웃되면 None)
+        self.pending_mode_target = None
+        self.pending_mode_start = 0.0
+        self.pending_mode_last = 0.0
+
         self.log_path, self.log_file, self.log_writer = open_log()
 
         self._embedded_hwnd = None    # 3D 창이 재부모화되면 그 HWND로 채워짐
@@ -726,6 +742,8 @@ class RocketGCS(tk.Tk):
         self.landed_ref_ms = None
         self.graph_frozen = False
         self.peak_alt_m = None
+        self.pending_mode_cmd = None
+        self.pending_mode_target = None
         self.prev_cmd_rx_count = 0
 
     def _log_event(self, msg: str, color=None):
@@ -1057,16 +1075,26 @@ class RocketGCS(tk.Tk):
         # TclError로 죽어서 _tick() 전체가 멈추는 버그가 있었음. winfo_exists()로 방지.
         if not self.emer_btn.winfo_exists():
             return
-        mode = self.last_pkt.flight_mode if self.last_pkt else -1
-        can_eject = bool(self.link) and mode not in (0, 4)
+        # 링크가 나쁘면 GCS가 "확인한" 모드가 실제보다 뒤처질 수 있어서(텔레메트리
+        # 지연/유실), 모드 조건으로 버튼을 잠그지 않음 — 어차피 펌웨어가
+        # handleCommand()에서 대기·착륙 모드면 명령을 그냥 무시하니 안전은 그대로
+        # 지켜지고, GCS 화면이 안 따라와도 사람이 바로 시도할 수 있게 함.
+        can_eject = bool(self.link)
         self.emer_btn.config(state="normal" if can_eject else "disabled")
 
     # ── 모드 제어 명령 (되돌릴 수 없는 것만 확인창) ─────────────────────────
+    def _arm_mode_retry(self, cmd):
+        self.pending_mode_cmd = cmd
+        self.pending_mode_target = TARGET_MODE_AFTER.get(cmd)
+        self.pending_mode_start = time.time()
+        self.pending_mode_last = time.time()
+
     def _send_mode_cmd(self, cmd, needs_confirm):
         if not self.link:
             return
         if not needs_confirm:
             self.link.send_cmd(cmd)
+            self._arm_mode_retry(cmd)
             return
         dlg = tk.Toplevel(self)
         dlg.title("비행 강제진입 확인")
@@ -1083,6 +1111,7 @@ class RocketGCS(tk.Tk):
 
         def on_confirm():
             self.link.send_cmd(cmd)
+            self._arm_mode_retry(cmd)
             dlg.destroy()
 
         btn_row = tk.Frame(dlg, bg=SURFACE)
@@ -1211,6 +1240,16 @@ class RocketGCS(tk.Tk):
                     self.emer_progress_lbl.config(
                         text=f"📡 재전송 중... {self.retry_sent}회\n확인 대기")
 
+        # ── 모드전환 명령 자동 재전송 엔진 (대기↔준비, 강제비행, 강제착륙) ──────
+        if self.pending_mode_cmd is not None:
+            reached = last is not None and last.flight_mode == self.pending_mode_target
+            timed_out = (now - self.pending_mode_start) > MODE_CMD_RETRY_MAX_S
+            if reached or timed_out:
+                self.pending_mode_cmd = None
+            elif self.link and now - self.pending_mode_last >= MODE_CMD_RETRY_GAP_S:
+                self.link.send_cmd(self.pending_mode_cmd)
+                self.pending_mode_last = now
+
         # ── 상단바 ──────────────────────────────────────────────
         self.rx_lbl.config(text=f"{rate} pkt/s")
         cur_mode = last.flight_mode if last else -1
@@ -1292,11 +1331,12 @@ class RocketGCS(tk.Tk):
         self.alt_spark.update_data(self.alt_hist, self.t_hist, peak=self.peak_alt_m)
         self.ax_spark.update_data(self.acc_hist, self.t_hist)
 
-        # 모드 버튼 활성/비활성
+        # 모드 버튼 활성/비활성 — 링크가 나쁘면 GCS가 확인한 모드가 실제보다
+        # 뒤처질 수 있어서 모드 조건으로 잠그지 않음 (펌웨어가 실제 안전장치)
         for cmd, (btn, req_mode) in self.mode_btns.items():
-            enabled = bool(self.link) and cur_mode == req_mode
+            enabled = bool(self.link)
             btn.config(state="normal" if enabled else "disabled")
-        reset_enabled = bool(self.link) and cur_mode in (0, 4)
+        reset_enabled = bool(self.link)
         self.reset_btn.config(
             state="normal" if reset_enabled else "disabled",
             fg=CYAN if reset_enabled else MUTED,
